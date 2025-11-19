@@ -1,0 +1,24 @@
+{
+  "name": "codex-wrapper-mcp",
+  "version": "1.0.0",
+  "description": "MCP wrapper for Codex that returns session IDs for multi-turn conversations",
+  "main": "server.js",
+  "bin": {
+    "codex-wrapper-mcp": "server.js"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "mcp",
+    "codex",
+    "ai",
+    "wrapper"
+  ],
+  "author": "Claude & Lance",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "type": "commonjs"
+}
