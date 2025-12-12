@@ -102,6 +102,34 @@ function handleToolsList(message) {
           },
           required: ['conversationId', 'prompt']
         }
+      },
+      {
+        name: 'codex-review',
+        description: 'Run a Codex code review on the current repository.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            mode: {
+              type: 'string',
+              enum: ['uncommitted', 'base', 'commit', 'custom'],
+              description: 'Review preset to run: `uncommitted` (staged/unstaged/untracked), `base` (against a base branch), `commit` (a single commit), `custom` (your instructions).'
+            },
+            base: {
+              type: 'string',
+              description: 'Base branch name when mode=`base` (PR-style review).'
+            },
+            commit: {
+              type: 'string',
+              description: 'Commit SHA when mode=`commit`.'
+            },
+            prompt: {
+              type: 'string',
+              description: 'Custom review instructions when mode=`custom`.'
+            },
+            cwd: { type: 'string', description: 'Working directory (repo root). If omitted, uses the server process CWD.' }
+          },
+          required: ['mode']
+        }
       }
     ]
   });
@@ -125,6 +153,15 @@ async function handleToolCall(message) {
       sendResponse(message.id, {
         content: [
           { type: 'text', text: result.output }
+        ]
+      });
+
+    } else if (name === 'codex-review') {
+      const result = await runCodexReview(args);
+      sendResponse(message.id, {
+        content: [
+          { type: 'text', text: result.output },
+          { type: 'text', text: `\n[SESSION_ID: ${result.sessionId}]` }
         ]
       });
 
@@ -256,6 +293,118 @@ function runCodexResume(sessionId, prompt) {
       } else {
         resolve({ output });
       }
+    });
+  });
+}
+
+function runCodexReview(args) {
+  return new Promise((resolve, reject) => {
+    if (!args || !args.mode) {
+      reject(new Error('codex-review requires mode'));
+      return;
+    }
+
+    // Build CLI command: codex exec [exec opts] --json review [review opts] [PROMPT]
+    const cliArgs = ['exec'];
+
+    if (args.cwd) {
+      cliArgs.push('-C', args.cwd);
+    }
+
+    // JSON output must come before subcommand
+    cliArgs.push('--json');
+    cliArgs.push('review');
+
+    switch (args.mode) {
+      case 'uncommitted':
+        cliArgs.push('--uncommitted');
+        break;
+      case 'base':
+        if (!args.base) {
+          reject(new Error('mode=base requires base'));
+          return;
+        }
+        cliArgs.push('--base', String(args.base));
+        break;
+      case 'commit':
+        if (!args.commit) {
+          reject(new Error('mode=commit requires commit'));
+          return;
+        }
+        cliArgs.push('--commit', String(args.commit));
+        break;
+      case 'custom':
+        if (!args.prompt || !args.prompt.trim()) {
+          reject(new Error('mode=custom requires prompt'));
+          return;
+        }
+        cliArgs.push(args.prompt.trim());
+        break;
+      default:
+        reject(new Error(`Unknown review mode: ${args.mode}`));
+        return;
+    }
+
+    const proc = spawn('codex', cliArgs, {
+      env: process.env,
+      cwd: args.cwd || process.cwd()
+    });
+
+    let output = '';
+    let sessionId = null;
+    let finalMessage = '';
+
+    proc.stdout.on('data', (data) => {
+      output += data.toString();
+      const lines = data.toString().split('\n');
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+
+        try {
+          const json = JSON.parse(line);
+
+          if (json.type === 'thread.started' && json.thread_id) {
+            sessionId = json.thread_id;
+          }
+
+          if (json.type === 'item.completed' &&
+              json.item?.type === 'agent_message' &&
+              json.item?.text) {
+            finalMessage = json.item.text;
+          }
+        } catch (e) {
+          // Not JSON, ignore
+        }
+      }
+    });
+
+    proc.stderr.on('data', (data) => {
+      console.error('Codex stderr:', data.toString());
+    });
+
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`Codex review exited with code ${code}`));
+        return;
+      }
+
+      if (!sessionId) {
+        const match = output.match(/thread_id[":]+([0-9a-f-]{36})/);
+        if (match) {
+          sessionId = match[1];
+        }
+      }
+
+      if (!sessionId) {
+        reject(new Error('Could not extract session ID from Codex review output'));
+        return;
+      }
+
+      resolve({
+        sessionId,
+        output: finalMessage || output
+      });
     });
   });
 }

@@ -13,6 +13,7 @@ The native Codex MCP server (`mcp__codex__codex`) doesn't return session IDs, ma
 3. Parses JSON output to extract session ID from `thread.started` event
 4. Returns both response text AND `[SESSION_ID: xxx]` to the client
 5. Translates MCP `codex-reply` calls to `codex exec resume` CLI commands
+6. Translates MCP `codex-review` calls to `codex exec --json review` for non-interactive code reviews
 
 ## Prerequisites
 
@@ -58,6 +59,24 @@ mcp__codex__codex_reply({
   conversationId: "019a7661-3643-7ac3-aeb9-098a910935fb",
   prompt: "follow-up question"
 })
+```
+
+### Code reviews
+
+Run the same review presets as `/review` in the interactive Codex CLI:
+
+```javascript
+// Review uncommitted changes
+mcp__codex__codex_review({ mode: "uncommitted", cwd: "/path/to/repo" })
+
+// Review against base branch
+mcp__codex__codex_review({ mode: "base", base: "main", cwd: "/path/to/repo" })
+
+// Review a commit
+mcp__codex__codex_review({ mode: "commit", commit: "e119e00", cwd: "/path/to/repo" })
+
+// Custom review instructions
+mcp__codex__codex_review({ mode: "custom", prompt: "Focus on security issues.", cwd: "/path/to/repo" })
 ```
 
 ## Advantages Over Native MCP
