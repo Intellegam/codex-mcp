@@ -152,7 +152,8 @@ async function handleToolCall(message) {
       const result = await runCodexResume(args.conversationId, args.prompt);
       sendResponse(message.id, {
         content: [
-          { type: 'text', text: result.output }
+          { type: 'text', text: result.output },
+          { type: 'text', text: `\n[SESSION_ID: ${result.sessionId}]` }
         ]
       });
 
@@ -174,236 +175,161 @@ async function handleToolCall(message) {
 }
 
 function runCodexStart(args) {
-  return new Promise((resolve, reject) => {
-    // Build CLI command
-    const cliArgs = ['exec', args.prompt];
+  // Build CLI command
+  const cliArgs = ['exec', args.prompt];
 
-    if (args.sandbox) {
-      cliArgs.push('--sandbox', args.sandbox);
-    }
-    if (args.model) {
-      cliArgs.push('-m', args.model);
-    }
-    if (args.cwd) {
-      cliArgs.push('-C', args.cwd);
-    }
+  if (args.sandbox) {
+    cliArgs.push('--sandbox', args.sandbox);
+  }
+  if (args.model) {
+    cliArgs.push('-m', args.model);
+  }
+  if (args.cwd) {
+    cliArgs.push('-C', args.cwd);
+  }
 
-    // Add JSON flag to get structured output
-    cliArgs.push('--json');
+  // Add JSON flag to get structured output
+  cliArgs.push('--json');
 
-    // Spawn Codex CLI
-    const proc = spawn('codex', cliArgs, {
-      env: process.env,
-      cwd: args.cwd || process.cwd()
+  return runCodexJsonl(cliArgs, {
+    cwd: args.cwd,
+    label: 'Codex'
+  }).then((result) => {
+    // Store session info
+    sessions.set(result.sessionId, {
+      created: Date.now(),
+      initialPrompt: args.prompt
     });
-
-    let output = '';
-    let jsonLines = [];
-    let sessionId = null;
-    let finalMessage = '';
-
-    proc.stdout.on('data', (data) => {
-      output += data.toString();
-      const lines = data.toString().split('\n');
-
-      for (const line of lines) {
-        if (!line.trim()) continue;
-
-        try {
-          const json = JSON.parse(line);
-          jsonLines.push(json);
-
-          // Extract session ID from thread.started event
-          if (json.type === 'thread.started' && json.thread_id) {
-            sessionId = json.thread_id;
-          }
-
-          // Extract final message from agent_message events
-          if (json.type === 'item.completed' &&
-              json.item?.type === 'agent_message' &&
-              json.item?.text) {
-            finalMessage = json.item.text;
-          }
-        } catch (e) {
-          // Not JSON, ignore
-        }
-      }
-    });
-
-    proc.stderr.on('data', (data) => {
-      console.error('Codex stderr:', data.toString());
-    });
-
-    proc.on('close', (code) => {
-      if (code !== 0) {
-        reject(new Error(`Codex exited with code ${code}`));
-      } else if (!sessionId) {
-        // Fallback: try to extract from output if JSON parsing failed
-        const match = output.match(/thread_id[":]+([0-9a-f-]{36})/);
-        if (match) {
-          sessionId = match[1];
-        }
-
-        if (!sessionId) {
-          reject(new Error('Could not extract session ID from Codex output'));
-        } else {
-          resolve({
-            sessionId,
-            output: finalMessage || output
-          });
-        }
-      } else {
-        // Store session info
-        sessions.set(sessionId, {
-          created: Date.now(),
-          initialPrompt: args.prompt
-        });
-
-        resolve({
-          sessionId,
-          output: finalMessage || output
-        });
-      }
-    });
+    return result;
   });
 }
 
 function runCodexResume(sessionId, prompt) {
-  return new Promise((resolve, reject) => {
-    // Use CLI resume command
-    const proc = spawn('codex', [
-      'exec', 'resume', sessionId, prompt
-    ], {
-      env: process.env
-    });
-
-    let output = '';
-
-    proc.stdout.on('data', (data) => {
-      output += data.toString();
-    });
-
-    proc.stderr.on('data', (data) => {
-      console.error('Codex stderr:', data.toString());
-    });
-
-    proc.on('close', (code) => {
-      if (code !== 0) {
-        reject(new Error(`Codex resume exited with code ${code}`));
-      } else {
-        resolve({ output });
-      }
-    });
+  const cliArgs = ['exec', '--json', 'resume', sessionId, prompt];
+  return runCodexJsonl(cliArgs, {
+    cwd: undefined,
+    label: 'Codex resume'
   });
 }
 
 function runCodexReview(args) {
+  if (!args || !args.mode) {
+    return Promise.reject(new Error('codex-review requires mode'));
+  }
+
+  // Build CLI command: codex exec [exec opts] --json review [review opts] [PROMPT]
+  const cliArgs = ['exec'];
+
+  if (args.cwd) {
+    cliArgs.push('-C', args.cwd);
+  }
+
+  // JSON output must come before subcommand
+  cliArgs.push('--json');
+  cliArgs.push('review');
+
+  switch (args.mode) {
+    case 'uncommitted':
+      cliArgs.push('--uncommitted');
+      break;
+    case 'base':
+      if (!args.base) {
+        return Promise.reject(new Error('mode=base requires base'));
+      }
+      cliArgs.push('--base', String(args.base));
+      break;
+    case 'commit':
+      if (!args.commit) {
+        return Promise.reject(new Error('mode=commit requires commit'));
+      }
+      cliArgs.push('--commit', String(args.commit));
+      break;
+    case 'custom':
+      if (!args.prompt || !args.prompt.trim()) {
+        return Promise.reject(new Error('mode=custom requires prompt'));
+      }
+      cliArgs.push(args.prompt.trim());
+      break;
+    default:
+      return Promise.reject(new Error(`Unknown review mode: ${args.mode}`));
+  }
+
+  return runCodexJsonl(cliArgs, {
+    cwd: args.cwd,
+    label: 'Codex review'
+  });
+}
+
+function runCodexJsonl(cliArgs, { cwd, label }) {
   return new Promise((resolve, reject) => {
-    if (!args || !args.mode) {
-      reject(new Error('codex-review requires mode'));
-      return;
-    }
-
-    // Build CLI command: codex exec [exec opts] --json review [review opts] [PROMPT]
-    const cliArgs = ['exec'];
-
-    if (args.cwd) {
-      cliArgs.push('-C', args.cwd);
-    }
-
-    // JSON output must come before subcommand
-    cliArgs.push('--json');
-    cliArgs.push('review');
-
-    switch (args.mode) {
-      case 'uncommitted':
-        cliArgs.push('--uncommitted');
-        break;
-      case 'base':
-        if (!args.base) {
-          reject(new Error('mode=base requires base'));
-          return;
-        }
-        cliArgs.push('--base', String(args.base));
-        break;
-      case 'commit':
-        if (!args.commit) {
-          reject(new Error('mode=commit requires commit'));
-          return;
-        }
-        cliArgs.push('--commit', String(args.commit));
-        break;
-      case 'custom':
-        if (!args.prompt || !args.prompt.trim()) {
-          reject(new Error('mode=custom requires prompt'));
-          return;
-        }
-        cliArgs.push(args.prompt.trim());
-        break;
-      default:
-        reject(new Error(`Unknown review mode: ${args.mode}`));
-        return;
-    }
-
     const proc = spawn('codex', cliArgs, {
       env: process.env,
-      cwd: args.cwd || process.cwd()
+      cwd: cwd || process.cwd()
     });
 
-    let output = '';
+    const stdoutRl = readline.createInterface({
+      input: proc.stdout,
+      crlfDelay: Infinity
+    });
+
+    let rawOutput = '';
     let sessionId = null;
     let finalMessage = '';
 
-    proc.stdout.on('data', (data) => {
-      output += data.toString();
-      const lines = data.toString().split('\n');
+    stdoutRl.on('line', (line) => {
+      rawOutput += `${line}\n`;
+      const trimmed = line.trim();
+      if (!trimmed) return;
 
-      for (const line of lines) {
-        if (!line.trim()) continue;
+      try {
+        const json = JSON.parse(trimmed);
 
-        try {
-          const json = JSON.parse(line);
-
-          if (json.type === 'thread.started' && json.thread_id) {
-            sessionId = json.thread_id;
-          }
-
-          if (json.type === 'item.completed' &&
-              json.item?.type === 'agent_message' &&
-              json.item?.text) {
-            finalMessage = json.item.text;
-          }
-        } catch (e) {
-          // Not JSON, ignore
+        if (json.type === 'thread.started' && json.thread_id) {
+          sessionId = json.thread_id;
         }
+
+        if (json.type === 'item.completed' &&
+            json.item?.type === 'agent_message' &&
+            json.item?.text) {
+          finalMessage = json.item.text;
+        }
+      } catch (e) {
+        // Not JSON, ignore
       }
     });
 
     proc.stderr.on('data', (data) => {
-      console.error('Codex stderr:', data.toString());
+      console.error(`${label} stderr:`, data.toString());
+    });
+
+    proc.on('error', (err) => {
+      stdoutRl.close();
+      reject(err);
     });
 
     proc.on('close', (code) => {
+      stdoutRl.close();
+
       if (code !== 0) {
-        reject(new Error(`Codex review exited with code ${code}`));
+        reject(new Error(`${label} exited with code ${code}`));
         return;
       }
 
       if (!sessionId) {
-        const match = output.match(/thread_id[":]+([0-9a-f-]{36})/);
+        const match = rawOutput.match(/thread_id[":]+([0-9a-f-]{36})/);
         if (match) {
           sessionId = match[1];
         }
       }
 
       if (!sessionId) {
-        reject(new Error('Could not extract session ID from Codex review output'));
+        reject(new Error(`Could not extract session ID from ${label} output`));
         return;
       }
 
       resolve({
         sessionId,
-        output: finalMessage || output
+        output: finalMessage || rawOutput
       });
     });
   });
