@@ -23,25 +23,47 @@ The native Codex MCP server (`mcp__codex__codex`) doesn't return session IDs, ma
 
 ## Installation
 
-1. Clone the repository to the standard MCP servers location:
-   ```bash
-   git clone <repo-url> ~/.claude/mcp-servers/codex-wrapper
-   cd ~/.claude/mcp-servers/codex-wrapper
-   ```
+### Quick install (recommended)
 
-2. Add the MCP server to Claude Code:
+Run the server directly from GitHub via `npx`:
 
 ```bash
-# Add the wrapper to Claude Code
-claude mcp add --transport stdio codex-wrapper -- node ~/.claude/mcp-servers/codex-wrapper/server.js
+claude mcp add codex-agent -- npx -y github:hburrichter/codex-mcp
+```
 
-# Verify it's installed
+Verify it’s connected:
+
+```bash
 claude mcp list
 ```
 
-You should see `codex-wrapper` in the list with a ✓ Connected status.
+### Project-local config (.mcp.json)
 
-**Note:** The wrapper will be available in your next Claude Code session. If you're in an active session, restart it to load the new MCP tools.
+Add this to a project to auto‑load the server for that repo:
+
+```json
+{
+  "mcpServers": {
+    "codex-agent": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "github:hburrichter/codex-mcp"],
+      "env": {}
+    }
+  }
+}
+```
+
+### Alternative: local clone
+
+If you prefer a local checkout:
+
+```bash
+git clone https://github.com/hburrichter/codex-mcp ~/.claude/mcp-servers/codex-agent
+claude mcp add --transport stdio codex-agent -- node ~/.claude/mcp-servers/codex-agent/server.js
+```
+
+**Note:** Tools will be namespaced under whatever server name you choose.
 
 ## Usage
 
