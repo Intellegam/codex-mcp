@@ -7,61 +7,61 @@
  * This gives us session IDs reliably from JSON output!
  */
 
-const { spawn } = require('child_process');
-const readline = require('readline');
+const { spawn } = require("child_process");
+const readline = require("readline");
 
 // MCP protocol uses JSON-RPC over stdio
 const rl = readline.createInterface({
   input: process.stdin,
   output: process.stdout,
-  terminal: false
+  terminal: false,
 });
 
 // Store active sessions: sessionId -> {prompt, created}
 const sessions = new Map();
 
 // Handle incoming JSON-RPC messages
-rl.on('line', async (line) => {
+rl.on("line", async (line) => {
   try {
     const message = JSON.parse(line);
 
     // Route different MCP methods
     switch (message.method) {
-      case 'initialize':
+      case "initialize":
         handleInitialize(message);
         break;
 
-      case 'initialized':
+      case "initialized":
         // Client confirming initialization
         break;
 
-      case 'tools/list':
+      case "tools/list":
         handleToolsList(message);
         break;
 
-      case 'tools/call':
+      case "tools/call":
         await handleToolCall(message);
         break;
 
       default:
-        sendError(message.id, -32601, 'Method not found');
+        sendError(message.id, -32601, "Method not found");
     }
   } catch (e) {
-    console.error('Error processing message:', e);
+    console.error("Error processing message:", e);
   }
 });
 
 function handleInitialize(message) {
   sendResponse(message.id, {
-    protocolVersion: '2024-11-05',
+    protocolVersion: "2024-11-05",
     capabilities: {
       tools: {},
-      resources: {}
+      resources: {},
     },
     serverInfo: {
-      name: 'codex-cli-wrapper',
-      version: '1.0.0'
-    }
+      name: "codex-cli-wrapper",
+      version: "1.0.0",
+    },
   });
 }
 
@@ -69,69 +69,83 @@ function handleToolsList(message) {
   sendResponse(message.id, {
     tools: [
       {
-        name: 'codex',
-        description: 'Start a new Codex session. Use like a sub-agent: be specific in prompts, provide context. Sessions can be resumed with codex-reply.',
+        name: "codex",
+        description:
+          "Start a new Codex session. Use like a sub-agent: be specific in prompts, provide context. Sessions can be resumed with codex-reply.",
         inputSchema: {
-          type: 'object',
+          type: "object",
           properties: {
-            prompt: { type: 'string', description: 'The prompt for Codex' },
+            prompt: { type: "string", description: "The prompt for Codex" },
             sandbox: {
-              type: 'string',
-              enum: ['read-only', 'workspace-write', 'danger-full-access'],
-              description: 'Sandbox mode. Defaults to read-only. WARNING: workspace-write and danger-full-access allow Codex to modify files. Use only when explicitly needed and with caution.'
+              type: "string",
+              enum: ["read-only", "workspace-write", "danger-full-access"],
+              description:
+                "Sandbox mode. Defaults to read-only. WARNING: workspace-write and danger-full-access allow Codex to modify files. Use only when explicitly needed and with caution.",
             },
-            'approval-policy': {
-              type: 'string',
-              enum: ['untrusted', 'on-failure', 'on-request', 'never'],
-              description: 'Approval policy'
+            "approval-policy": {
+              type: "string",
+              enum: ["untrusted", "on-failure", "on-request", "never"],
+              description: "Approval policy",
             },
-            cwd: { type: 'string', description: 'Working directory' },
-            model: { type: 'string', description: 'Model override' }
+            cwd: { type: "string", description: "Working directory" },
+            model: { type: "string", description: "Model override" },
           },
-          required: ['prompt']
-        }
+          required: ["prompt"],
+        },
       },
       {
-        name: 'codex-reply',
-        description: 'Continue an existing Codex session. Use for multi-turn discussions where prior context matters (e.g., follow-up questions, asking for review after brainstorming).',
+        name: "codex-reply",
+        description:
+          "Continue an existing Codex session. Use for multi-turn discussions where prior context matters (e.g., follow-up questions, asking for review after brainstorming).",
         inputSchema: {
-          type: 'object',
+          type: "object",
           properties: {
-            conversationId: { type: 'string', description: 'Session ID from a previous codex or codex-reply call' },
-            prompt: { type: 'string', description: 'Follow-up prompt' }
+            conversationId: {
+              type: "string",
+              description:
+                "Session ID from a previous codex or codex-reply call",
+            },
+            prompt: { type: "string", description: "Follow-up prompt" },
           },
-          required: ['conversationId', 'prompt']
-        }
+          required: ["conversationId", "prompt"],
+        },
       },
       {
-        name: 'codex-review',
-        description: 'Run a Codex code review on the current repository. Spawns a fresh session with a specialized review system prompt. For reviews needing prior conversation context, use codex-reply instead.',
+        name: "codex-review",
+        description:
+          "Run a Codex code review on the current repository. Spawns a fresh session with a specialized review system prompt. For reviews needing prior conversation context, use codex-reply instead.",
         inputSchema: {
-          type: 'object',
+          type: "object",
           properties: {
             mode: {
-              type: 'string',
-              enum: ['uncommitted', 'base', 'commit', 'custom'],
-              description: 'Review preset to run: `uncommitted` (staged/unstaged/untracked), `base` (against a base branch), `commit` (a single commit), `custom` (your instructions).'
+              type: "string",
+              enum: ["uncommitted", "base", "commit", "custom"],
+              description:
+                "Review preset to run: `uncommitted` (staged/unstaged/untracked), `base` (against a base branch), `commit` (a single commit), `custom` (your instructions).",
             },
             base: {
-              type: 'string',
-              description: 'Base branch name when mode=`base` (PR-style review).'
+              type: "string",
+              description:
+                "Base branch name when mode=`base` (PR-style review).",
             },
             commit: {
-              type: 'string',
-              description: 'Commit SHA when mode=`commit`.'
+              type: "string",
+              description: "Commit SHA when mode=`commit`.",
             },
             prompt: {
-              type: 'string',
-              description: 'Custom review instructions when mode=`custom`.'
+              type: "string",
+              description: "Custom review instructions when mode=`custom`.",
             },
-            cwd: { type: 'string', description: 'Working directory (repo root). If omitted, uses the server process CWD.' }
+            cwd: {
+              type: "string",
+              description:
+                "Working directory (repo root). If omitted, uses the server process CWD.",
+            },
           },
-          required: ['mode']
-        }
-      }
-    ]
+          required: ["mode"],
+        },
+      },
+    ],
   });
 }
 
@@ -139,33 +153,30 @@ async function handleToolCall(message) {
   const { name, arguments: args } = message.params;
 
   try {
-    if (name === 'codex') {
+    if (name === "codex") {
       const result = await runCodexStart(args);
       sendResponse(message.id, {
         content: [
-          { type: 'text', text: result.output },
-          { type: 'text', text: `\n[SESSION_ID: ${result.sessionId}]` }
-        ]
+          { type: "text", text: result.output },
+          { type: "text", text: `\n[SESSION_ID: ${result.sessionId}]` },
+        ],
       });
-
-    } else if (name === 'codex-reply') {
+    } else if (name === "codex-reply") {
       const result = await runCodexResume(args.conversationId, args.prompt);
       sendResponse(message.id, {
         content: [
-          { type: 'text', text: result.output },
-          { type: 'text', text: `\n[SESSION_ID: ${result.sessionId}]` }
-        ]
+          { type: "text", text: result.output },
+          { type: "text", text: `\n[SESSION_ID: ${result.sessionId}]` },
+        ],
       });
-
-    } else if (name === 'codex-review') {
+    } else if (name === "codex-review") {
       const result = await runCodexReview(args);
       sendResponse(message.id, {
         content: [
-          { type: 'text', text: result.output },
-          { type: 'text', text: `\n[SESSION_ID: ${result.sessionId}]` }
-        ]
+          { type: "text", text: result.output },
+          { type: "text", text: `\n[SESSION_ID: ${result.sessionId}]` },
+        ],
       });
-
     } else {
       sendError(message.id, -32602, `Unknown tool: ${name}`);
     }
@@ -176,77 +187,77 @@ async function handleToolCall(message) {
 
 function runCodexStart(args) {
   // Build CLI command
-  const cliArgs = ['exec', args.prompt];
+  const cliArgs = ["exec", args.prompt];
 
   // Default to read-only sandbox for safety
-  const sandbox = args.sandbox || 'read-only';
-  cliArgs.push('--sandbox', sandbox);
+  const sandbox = args.sandbox || "read-only";
+  cliArgs.push("--sandbox", sandbox);
   if (args.model) {
-    cliArgs.push('-m', args.model);
+    cliArgs.push("-m", args.model);
   }
   if (args.cwd) {
-    cliArgs.push('-C', args.cwd);
+    cliArgs.push("-C", args.cwd);
   }
 
   // Add JSON flag to get structured output
-  cliArgs.push('--json');
+  cliArgs.push("--json");
 
   return runCodexJsonl(cliArgs, {
     cwd: args.cwd,
-    label: 'Codex'
+    label: "Codex",
   }).then((result) => {
     // Store session info
     sessions.set(result.sessionId, {
       created: Date.now(),
-      initialPrompt: args.prompt
+      initialPrompt: args.prompt,
     });
     return result;
   });
 }
 
 function runCodexResume(sessionId, prompt) {
-  const cliArgs = ['exec', '--json', 'resume', sessionId, prompt];
+  const cliArgs = ["exec", "--json", "resume", sessionId, prompt];
   return runCodexJsonl(cliArgs, {
     cwd: undefined,
-    label: 'Codex resume'
+    label: "Codex resume",
   });
 }
 
 function runCodexReview(args) {
   if (!args || !args.mode) {
-    return Promise.reject(new Error('codex-review requires mode'));
+    return Promise.reject(new Error("codex-review requires mode"));
   }
 
   // Build CLI command: codex exec [exec opts] --json review [review opts] [PROMPT]
-  const cliArgs = ['exec'];
+  const cliArgs = ["exec"];
 
   if (args.cwd) {
-    cliArgs.push('-C', args.cwd);
+    cliArgs.push("-C", args.cwd);
   }
 
   // JSON output must come before subcommand
-  cliArgs.push('--json');
-  cliArgs.push('review');
+  cliArgs.push("--json");
+  cliArgs.push("review");
 
   switch (args.mode) {
-    case 'uncommitted':
-      cliArgs.push('--uncommitted');
+    case "uncommitted":
+      cliArgs.push("--uncommitted");
       break;
-    case 'base':
+    case "base":
       if (!args.base) {
-        return Promise.reject(new Error('mode=base requires base'));
+        return Promise.reject(new Error("mode=base requires base"));
       }
-      cliArgs.push('--base', String(args.base));
+      cliArgs.push("--base", String(args.base));
       break;
-    case 'commit':
+    case "commit":
       if (!args.commit) {
-        return Promise.reject(new Error('mode=commit requires commit'));
+        return Promise.reject(new Error("mode=commit requires commit"));
       }
-      cliArgs.push('--commit', String(args.commit));
+      cliArgs.push("--commit", String(args.commit));
       break;
-    case 'custom':
+    case "custom":
       if (!args.prompt || !args.prompt.trim()) {
-        return Promise.reject(new Error('mode=custom requires prompt'));
+        return Promise.reject(new Error("mode=custom requires prompt"));
       }
       cliArgs.push(args.prompt.trim());
       break;
@@ -256,27 +267,27 @@ function runCodexReview(args) {
 
   return runCodexJsonl(cliArgs, {
     cwd: args.cwd,
-    label: 'Codex review'
+    label: "Codex review",
   });
 }
 
 function runCodexJsonl(cliArgs, { cwd, label }) {
   return new Promise((resolve, reject) => {
-    const proc = spawn('codex', cliArgs, {
+    const proc = spawn("codex", cliArgs, {
       env: process.env,
-      cwd: cwd || process.cwd()
+      cwd: cwd || process.cwd(),
     });
 
     const stdoutRl = readline.createInterface({
       input: proc.stdout,
-      crlfDelay: Infinity
+      crlfDelay: Infinity,
     });
 
-    let rawOutput = '';
+    let rawOutput = "";
     let sessionId = null;
-    let finalMessage = '';
+    let finalMessage = "";
 
-    stdoutRl.on('line', (line) => {
+    stdoutRl.on("line", (line) => {
       rawOutput += `${line}\n`;
       const trimmed = line.trim();
       if (!trimmed) return;
@@ -284,13 +295,15 @@ function runCodexJsonl(cliArgs, { cwd, label }) {
       try {
         const json = JSON.parse(trimmed);
 
-        if (json.type === 'thread.started' && json.thread_id) {
+        if (json.type === "thread.started" && json.thread_id) {
           sessionId = json.thread_id;
         }
 
-        if (json.type === 'item.completed' &&
-            json.item?.type === 'agent_message' &&
-            json.item?.text) {
+        if (
+          json.type === "item.completed" &&
+          json.item?.type === "agent_message" &&
+          json.item?.text
+        ) {
           finalMessage = json.item.text;
         }
       } catch (e) {
@@ -298,16 +311,16 @@ function runCodexJsonl(cliArgs, { cwd, label }) {
       }
     });
 
-    proc.stderr.on('data', (data) => {
+    proc.stderr.on("data", (data) => {
       console.error(`${label} stderr:`, data.toString());
     });
 
-    proc.on('error', (err) => {
+    proc.on("error", (err) => {
       stdoutRl.close();
       reject(err);
     });
 
-    proc.on('close', (code) => {
+    proc.on("close", (code) => {
       stdoutRl.close();
 
       if (code !== 0) {
@@ -329,7 +342,7 @@ function runCodexJsonl(cliArgs, { cwd, label }) {
 
       resolve({
         sessionId,
-        output: finalMessage || rawOutput
+        output: finalMessage || rawOutput,
       });
     });
   });
@@ -337,30 +350,30 @@ function runCodexJsonl(cliArgs, { cwd, label }) {
 
 function sendResponse(id, result) {
   const response = {
-    jsonrpc: '2.0',
+    jsonrpc: "2.0",
     id,
-    result
+    result,
   };
   console.log(JSON.stringify(response));
 }
 
 function sendError(id, code, message) {
   const response = {
-    jsonrpc: '2.0',
+    jsonrpc: "2.0",
     id,
     error: {
       code,
-      message
-    }
+      message,
+    },
   };
   console.log(JSON.stringify(response));
 }
 
 // Clean shutdown
-process.on('SIGINT', () => {
+process.on("SIGINT", () => {
   process.exit();
 });
 
-process.on('SIGTERM', () => {
+process.on("SIGTERM", () => {
   process.exit();
 });
