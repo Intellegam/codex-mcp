@@ -70,7 +70,7 @@ function handleToolsList(message) {
     tools: [
       {
         name: 'codex',
-        description: 'Start a new Codex session',
+        description: 'Start a new Codex session. Use like a sub-agent: be specific in prompts, provide context. Sessions can be resumed with codex-reply.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -78,7 +78,7 @@ function handleToolsList(message) {
             sandbox: {
               type: 'string',
               enum: ['read-only', 'workspace-write', 'danger-full-access'],
-              description: 'Sandbox mode'
+              description: 'Sandbox mode. Defaults to read-only. WARNING: workspace-write and danger-full-access allow Codex to modify files. Use only when explicitly needed and with caution.'
             },
             'approval-policy': {
               type: 'string',
@@ -93,11 +93,11 @@ function handleToolsList(message) {
       },
       {
         name: 'codex-reply',
-        description: 'Continue an existing Codex session',
+        description: 'Continue an existing Codex session. Use for multi-turn discussions where prior context matters (e.g., follow-up questions, asking for review after brainstorming).',
         inputSchema: {
           type: 'object',
           properties: {
-            conversationId: { type: 'string', description: 'Session ID' },
+            conversationId: { type: 'string', description: 'Session ID from a previous codex or codex-reply call' },
             prompt: { type: 'string', description: 'Follow-up prompt' }
           },
           required: ['conversationId', 'prompt']
@@ -105,7 +105,7 @@ function handleToolsList(message) {
       },
       {
         name: 'codex-review',
-        description: 'Run a Codex code review on the current repository.',
+        description: 'Run a Codex code review on the current repository. Spawns a fresh session with a specialized review system prompt. For reviews needing prior conversation context, use codex-reply instead.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -178,9 +178,9 @@ function runCodexStart(args) {
   // Build CLI command
   const cliArgs = ['exec', args.prompt];
 
-  if (args.sandbox) {
-    cliArgs.push('--sandbox', args.sandbox);
-  }
+  // Default to read-only sandbox for safety
+  const sandbox = args.sandbox || 'read-only';
+  cliArgs.push('--sandbox', sandbox);
   if (args.model) {
     cliArgs.push('-m', args.model);
   }
