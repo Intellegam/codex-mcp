@@ -60,8 +60,10 @@ function handleInitialize(message) {
     },
     serverInfo: {
       name: "codex-cli-wrapper",
-      version: "1.0.0",
+      version: "1.1.0",
     },
+    instructions:
+      "IMPORTANT: Read the `collaborating-with-codex` skill before using any Codex tools. Codex is an external AI agent for second opinions on complex decisions. Form your own analysis first to avoid anchoring bias, then use Codex for brainstorming, plan validation, or code review. Sessions run in read-only sandbox mode.",
   });
 }
 
@@ -76,19 +78,7 @@ function handleToolsList(message) {
           type: "object",
           properties: {
             prompt: { type: "string", description: "The prompt for Codex" },
-            sandbox: {
-              type: "string",
-              enum: ["read-only", "workspace-write", "danger-full-access"],
-              description:
-                "Sandbox mode. Defaults to read-only. WARNING: workspace-write and danger-full-access allow Codex to modify files. Use only when explicitly needed and with caution.",
-            },
-            "approval-policy": {
-              type: "string",
-              enum: ["untrusted", "on-failure", "on-request", "never"],
-              description: "Approval policy",
-            },
             cwd: { type: "string", description: "Working directory" },
-            model: { type: "string", description: "Model override" },
           },
           required: ["prompt"],
         },
@@ -100,14 +90,14 @@ function handleToolsList(message) {
         inputSchema: {
           type: "object",
           properties: {
-            conversationId: {
+            sessionId: {
               type: "string",
               description:
                 "Session ID from a previous codex or codex-reply call",
             },
             prompt: { type: "string", description: "Follow-up prompt" },
           },
-          required: ["conversationId", "prompt"],
+          required: ["sessionId", "prompt"],
         },
       },
       {
@@ -162,7 +152,7 @@ async function handleToolCall(message) {
         ],
       });
     } else if (name === "codex-reply") {
-      const result = await runCodexResume(args.conversationId, args.prompt);
+      const result = await runCodexResume(args.sessionId, args.prompt);
       sendResponse(message.id, {
         content: [
           { type: "text", text: result.output },
@@ -189,12 +179,8 @@ function runCodexStart(args) {
   // Build CLI command
   const cliArgs = ["exec", args.prompt];
 
-  // Default to read-only sandbox for safety
-  const sandbox = args.sandbox || "read-only";
-  cliArgs.push("--sandbox", sandbox);
-  if (args.model) {
-    cliArgs.push("-m", args.model);
-  }
+  // Always use read-only sandbox for safety
+  cliArgs.push("--sandbox", "read-only");
   if (args.cwd) {
     cliArgs.push("-C", args.cwd);
   }

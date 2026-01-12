@@ -78,7 +78,7 @@ Extract the ID and use it for follow-ups:
 
 ```javascript
 mcp__codex__codex_reply({
-  conversationId: "019a7661-3643-7ac3-aeb9-098a910935fb",
+  sessionId: "019a7661-3643-7ac3-aeb9-098a910935fb",
   prompt: "follow-up question"
 })
 ```
