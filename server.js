@@ -60,7 +60,7 @@ function handleInitialize(message) {
     },
     serverInfo: {
       name: "codex-cli-wrapper",
-      version: "1.1.0",
+      version: "1.1.1",
     },
     instructions:
       "IMPORTANT: Read the `collaborating-with-codex` skill before using any Codex tools. Codex is an external AI agent for second opinions on complex decisions. Form your own analysis first to avoid anchoring bias, then use Codex for brainstorming, plan validation, or code review. Sessions run in read-only sandbox mode.",
