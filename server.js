@@ -103,7 +103,7 @@ function handleToolsList(message) {
       {
         name: "codex-review",
         description:
-          "Run a Codex code review on the current repository. Spawns a fresh session with a specialized review system prompt. For reviews needing prior conversation context, use codex-reply instead.",
+          "Run a Codex code review. In review mode, Codex uses a specialized review prompt. For reviews needing prior conversation context, use codex-reply instead.",
         inputSchema: {
           type: "object",
           properties: {
@@ -111,20 +111,20 @@ function handleToolsList(message) {
               type: "string",
               enum: ["uncommitted", "base", "commit", "custom"],
               description:
-                "Review preset to run: `uncommitted` (staged/unstaged/untracked), `base` (against a base branch), `commit` (a single commit), `custom` (your instructions).",
+                "REQUIRED. One of: `uncommitted` (review staged/unstaged/untracked changes), `base` (PR-style diff — also set `base`), `commit` (single commit — also set `commit`), `custom` (free-form — also set `prompt`).",
             },
             base: {
               type: "string",
               description:
-                "Base branch name when mode=`base` (PR-style review).",
+                'Branch name to diff against. Required when mode=`base`. Example: "main".',
             },
             commit: {
               type: "string",
-              description: "Commit SHA when mode=`commit`.",
+              description: "Commit SHA to review. Required when mode=`commit`.",
             },
             prompt: {
               type: "string",
-              description: "Custom review instructions when mode=`custom`.",
+              description: "Review instructions. Required when mode=`custom`.",
             },
             cwd: {
               type: "string",
