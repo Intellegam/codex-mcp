@@ -60,10 +60,10 @@ function handleInitialize(message) {
     },
     serverInfo: {
       name: "codex-cli-wrapper",
-      version: "1.1.1",
+      version: "1.2.0",
     },
     instructions:
-      "IMPORTANT: Read the `collaborating-with-codex` skill before using any Codex tools. Codex is an external AI agent for second opinions on complex decisions. Form your own analysis first to avoid anchoring bias, then use Codex for brainstorming, plan validation, or code review. Sessions run in read-only sandbox mode.",
+      "IMPORTANT: Read the `collaborating-with-codex` skill before using any Codex tools. Codex is an external AI agent for second opinions on complex decisions. Form your own analysis first to avoid anchoring bias, then use Codex for brainstorming, plan validation, or code review. The `codex` tool defaults to read-only sandbox; set writable: true to allow file writes and command execution.",
   });
 }
 
@@ -73,12 +73,17 @@ function handleToolsList(message) {
       {
         name: "codex",
         description:
-          "Start a new Codex session. Use like a sub-agent: be specific in prompts, provide context. Sessions can be resumed with codex-reply.",
+          "Start a new Codex session. Use like a sub-agent: be specific in prompts, provide context. Sessions can be resumed with `codex-reply` to continue the conversation.",
         inputSchema: {
           type: "object",
           properties: {
             prompt: { type: "string", description: "The prompt for Codex" },
             cwd: { type: "string", description: "Working directory" },
+            writable: {
+              type: "boolean",
+              description:
+                "Allow Codex to write files and run commands within the workspace. Defaults to false (read-only). CAUTION: When enabled, you MUST explicitly scope what Codex is and is not allowed to do in the prompt (e.g., 'run tests but do not modify any code', 'implement only in src/utils.js'). Never grant write access without clear boundaries in the prompt.",
+            },
           },
           required: ["prompt"],
         },
@@ -103,7 +108,7 @@ function handleToolsList(message) {
       {
         name: "codex-review",
         description:
-          "Run a Codex code review. In review mode, Codex uses a specialized review prompt. For reviews needing prior conversation context, use codex-reply instead.",
+          "Run a Codex code review on file changes (diffs, commits, uncommitted work). Reviews code quality, bugs, and correctness — not plans or architecture. For plan/architecture review, use `codex` or `codex-reply` instead.",
         inputSchema: {
           type: "object",
           properties: {
@@ -179,8 +184,12 @@ function runCodexStart(args) {
   // Build CLI command
   const cliArgs = ["exec", args.prompt];
 
-  // Always use read-only sandbox for safety
-  cliArgs.push("--sandbox", "read-only");
+  // Use workspace-write sandbox when writable, read-only otherwise
+  if (args.writable) {
+    cliArgs.push("--full-auto");
+  } else {
+    cliArgs.push("--sandbox", "read-only");
+  }
   if (args.cwd) {
     cliArgs.push("-C", args.cwd);
   }
@@ -216,6 +225,9 @@ function runCodexReview(args) {
 
   // Build CLI command: codex exec [exec opts] --json review [review opts] [PROMPT]
   const cliArgs = ["exec"];
+
+  // Reviews should always be read-only
+  cliArgs.push("--sandbox", "read-only");
 
   if (args.cwd) {
     cliArgs.push("-C", args.cwd);

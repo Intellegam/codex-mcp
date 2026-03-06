@@ -23,7 +23,7 @@ Single-file server (`server.js`) that:
 
 ## Tools Provided
 
-- `codex` - Start a new Codex session (read-only sandbox)
+- `codex` - Start a new Codex session (read-only by default, `writable: true` for workspace writes)
 - `codex-reply` - Continue an existing session using sessionId
 - `codex-review` - Run code reviews (uncommitted, base branch, commit, or custom)
 
