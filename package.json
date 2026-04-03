@@ -1,13 +1,16 @@
 {
   "name": "codex-wrapper-mcp",
-  "version": "1.2.0",
-  "description": "MCP wrapper for Codex that returns session IDs for multi-turn conversations",
+  "version": "2.0.0",
+  "description": "MCP server for Codex using the app-server protocol with timeout protection and session tracking",
   "main": "server.js",
   "bin": {
     "codex-wrapper-mcp": "server.js"
   },
   "scripts": {
-    "start": "node server.js"
+    "start": "bun server.js",
+    "test": "bun test",
+    "test:smoke": "bun test/smoke.js",
+    "send": "bun test/send.js"
   },
   "keywords": [
     "mcp",
@@ -18,7 +21,7 @@
   "author": "Claude & Lance",
   "license": "MIT",
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=18.0.0"
   },
   "type": "commonjs"
 }

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec node "/Users/hannes/Repositories/intellegam-workspace/codex-mcp/test/mock-codex.js" "$@"

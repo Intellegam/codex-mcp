@@ -1,24 +1,20 @@
-# Codex CLI-based MCP Server
+# Codex MCP Server
 
-An MCP server implementation that uses Codex CLI internally to provide reliable session ID tracking for multi-turn conversations.
-
-## Problem Solved
-
-The native Codex MCP server (`mcp__codex__codex`) doesn't return session IDs, making it difficult to continue conversations using `mcp__codex__codex_reply`. This server uses the CLI with JSON output to get session IDs reliably.
+An MCP server that communicates with Codex via the [app-server](https://developers.openai.com/codex/app-server) JSON-RPC protocol, providing reliable session tracking for multi-turn conversations with timeout protection.
 
 ## How It Works
 
-1. Acts as an MCP server (speaks JSON-RPC protocol)
-2. Translates MCP `codex` tool calls to `codex exec --json` CLI commands
-3. Parses JSON output to extract session ID from `thread.started` event
-4. Returns both response text AND `[SESSION_ID: xxx]` to the client
-5. Translates MCP `codex-reply` calls to `codex exec resume` CLI commands
-6. Translates MCP `codex-review` calls to `codex exec --json review` for non-interactive code reviews
+1. Acts as an MCP server (speaks JSON-RPC protocol over stdio)
+2. Spawns a single `codex app-server` process per MCP connection
+3. Translates MCP tool calls to app-server RPC methods (`thread/start`, `turn/start`, `review/start`)
+4. Collects streaming notifications until `turn/completed`
+5. Returns response text and `[SESSION_ID: xxx]` (the Codex thread ID) to the client
+6. Enforces configurable timeouts (default 5 minutes) to prevent indefinite hangs
 
 ## Prerequisites
 
-- Node.js 14.0 or higher
-- [Codex CLI](https://github.com/codex-cli/codex) installed and configured
+- Node.js 18.0 or higher
+- [Codex CLI](https://github.com/openai/codex) installed, configured, and supporting `codex app-server`
 - Claude Code installed
 
 ## Installation
@@ -31,7 +27,7 @@ Run the server directly from GitHub via `npx`:
 claude mcp add codex-agent -- npx -y github:hburrichter/codex-mcp
 ```
 
-Verify it’s connected:
+Verify it's connected:
 
 ```bash
 claude mcp list
@@ -39,7 +35,7 @@ claude mcp list
 
 ### Project-local config (.mcp.json)
 
-Add this to a project to auto‑load the server for that repo:
+Add this to a project to auto-load the server for that repo:
 
 ```json
 {
@@ -83,9 +79,19 @@ mcp__codex__codex_reply({
 })
 ```
 
+Within the same MCP connection, follow-ups work immediately. Across MCP reconnections, pass `cwd` to help the app-server locate the persisted thread on disk:
+
+```javascript
+mcp__codex__codex_reply({
+  sessionId: "019a7661-3643-7ac3-aeb9-098a910935fb",
+  prompt: "follow-up question",
+  cwd: "/path/to/original/repo"
+})
+```
+
 ### Code reviews
 
-Run the same review presets as `/review` in the interactive Codex CLI:
+Reviews are ephemeral — they do not return a session ID and cannot be resumed. Use `codex` instead of `codex-review` if follow-up discussion is needed.
 
 ```javascript
 // Review uncommitted changes
@@ -101,19 +107,19 @@ mcp__codex__codex_review({ mode: "commit", commit: "e119e00", cwd: "/path/to/rep
 mcp__codex__codex_review({ mode: "custom", prompt: "Focus on security issues.", cwd: "/path/to/repo" })
 ```
 
-## Advantages Over Native MCP
+## Configuration
 
-- **Reliable session IDs**: Extracted directly from CLI JSON output, not guessed
-- **No race conditions**: No filesystem scanning or timing issues
-- **Full compatibility**: Uses the same CLI commands that work perfectly
-- **Deterministic**: Session ID is guaranteed to be correct
+| Environment Variable | Default | Description |
+|---|---|---|
+| `CODEX_TIMEOUT_MS` | `300000` (5 min) | Maximum time to wait for a Codex response before timing out |
 
-## How It's Different
+## Architecture
 
-- **Native MCP**: Doesn't return session IDs, can't continue conversations
-- **This wrapper**: Returns session IDs reliably by using CLI internally
+Uses the Codex app-server JSON-RPC protocol instead of CLI subprocess calls:
 
-## Limitations
-
-- Slightly slower than native MCP (spawns CLI process)
-- Requires Node.js to run the wrapper
+- **Per-connection lifecycle**: One `codex app-server` process per MCP connection, isolated between concurrent Claude sessions
+- **Formal protocol**: Bidirectional JSON-RPC 2.0 with typed requests/responses and streaming notifications
+- **Timeout protection**: Configurable timeouts with `turn/interrupt` on expiry to prevent ghost turns
+- **Clean shutdown**: App server process is terminated on SIGINT, SIGTERM, or stdin close
+- **Session resume**: Non-ephemeral threads are persisted to `~/.codex/sessions/` by Codex after the first completed turn. `thread/resume` with `threadId` + `cwd` reloads them in a fresh app-server connection. Within the same connection, threads are already loaded and `turn/start` works directly (tracked via `loadedThreads` set)
+- **Parallel-safe notifications**: Each active turn registers a handler keyed by thread ID, so concurrent tool calls on different threads dispatch independently
