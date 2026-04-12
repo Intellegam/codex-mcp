@@ -103,7 +103,7 @@ describe("MCP protocol", () => {
     server = spawnServer();
     const resp = await server.mcpInit();
     expect(resp.result.serverInfo.name).toBe("codex-cli-wrapper");
-    expect(resp.result.serverInfo.version).toBe("2.0.0");
+    expect(resp.result.serverInfo.version).toBe("2.1.0");
     expect(resp.result.protocolVersion).toBe("2024-11-05");
   });
 

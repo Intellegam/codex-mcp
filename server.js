@@ -12,9 +12,10 @@ const { spawn } = require("child_process");
 const path = require("path");
 const readline = require("readline");
 
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
 const TIMEOUT_MS =
   parseInt(process.env.CODEX_TIMEOUT_MS, 10) || 5 * 60 * 1000;
+const REQUEST_TIMEOUT_MS = 5_000; // 5s for individual RPC requests (thread/start, etc.) — these are control-plane ops that return in milliseconds
 
 // ---------------------------------------------------------------------------
 // App Server Connection
@@ -81,13 +82,28 @@ class AppServerConnection {
     this.notify("initialized", {});
   }
 
-  request(method, params) {
+  request(method, params, timeoutMs = REQUEST_TIMEOUT_MS) {
     if (this.closed) {
       return Promise.reject(new Error("App server connection closed"));
     }
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
+      const timer = setTimeout(() => {
+        const pending = this.pending.get(id);
+        if (pending) {
+          this.pending.delete(id);
+          pending.reject(
+            new Error(`${method} timed out after ${Math.round(timeoutMs / 1000)}s`),
+          );
+        }
+      }, timeoutMs);
+      if (timer.unref) timer.unref();
+
+      this.pending.set(id, {
+        resolve: (val) => { clearTimeout(timer); resolve(val); },
+        reject: (err) => { clearTimeout(timer); reject(err); },
+        method,
+      });
       this._send({ id, method, params });
     });
   }
@@ -191,8 +207,20 @@ class AppServerConnection {
 let appServer = null;
 let appServerConnecting = null; // serializes concurrent init attempts
 
+function isAppServerHealthy(server) {
+  if (!server || server.closed) return false;
+  // Check if the underlying process is still running
+  if (server.proc && server.proc.exitCode !== null) return false;
+  return true;
+}
+
 async function getAppServer(cwd) {
-  if (appServer && !appServer.closed) return appServer;
+  if (isAppServerHealthy(appServer)) return appServer;
+  // Stale connection — close it so we don't leak
+  if (appServer) {
+    appServer.close();
+    appServer = null;
+  }
   // If another call is already connecting, wait for it instead of spawning a second
   if (appServerConnecting) return appServerConnecting;
   appServerConnecting = (async () => {
@@ -327,18 +355,29 @@ function captureTurn(server, threadId, startFn, timeoutMs) {
 // Tool implementations
 // ---------------------------------------------------------------------------
 
-async function runCodexStart(args) {
+async function runCodexStart(args, _retried = false) {
   const cwd = path.resolve(args.cwd || process.cwd());
   const server = await getAppServer(cwd);
 
-  const { thread } = await server.request("thread/start", {
-    cwd,
-    sandbox: args.writable ? "workspace-write" : "read-only",
-    approvalPolicy: "never",
-    // ephemeral: false persists the thread to ~/.codex/sessions/ after the first
-    // completed turn, enabling thread/resume by threadId+cwd in later connections.
-    ephemeral: false,
-  });
+  let thread;
+  try {
+    ({ thread } = await server.request("thread/start", {
+      cwd,
+      sandbox: args.writable ? "workspace-write" : "read-only",
+      approvalPolicy: "never",
+      // ephemeral: false persists the thread to ~/.codex/sessions/ after the first
+      // completed turn, enabling thread/resume by threadId+cwd in later connections.
+      ephemeral: false,
+    }));
+  } catch (err) {
+    // Stale connection — force reconnect and retry once
+    if (!_retried) {
+      server.close();
+      appServer = null;
+      return runCodexStart(args, true);
+    }
+    throw err;
+  }
 
   server.loadedThreads.add(thread.id);
 
@@ -356,7 +395,7 @@ async function runCodexStart(args) {
   return { sessionId: thread.id, output: result.output };
 }
 
-async function runCodexResume(sessionId, prompt, cwd) {
+async function runCodexResume(sessionId, prompt, cwd, _retried = false) {
   cwd = path.resolve(cwd || process.cwd());
   const server = await getAppServer(cwd);
 
@@ -366,12 +405,21 @@ async function runCodexResume(sessionId, prompt, cwd) {
   // as long as the thread had at least one completed turn (which persists it to
   // ~/.codex/sessions/). Without cwd the app-server cannot locate the rollout file.
   if (!server.loadedThreads.has(sessionId)) {
-    // Omit sandbox so the thread keeps its original setting (read-only or writable).
-    await server.request("thread/resume", {
-      threadId: sessionId,
-      cwd,
-      approvalPolicy: "never",
-    });
+    try {
+      // Omit sandbox so the thread keeps its original setting (read-only or writable).
+      await server.request("thread/resume", {
+        threadId: sessionId,
+        cwd,
+        approvalPolicy: "never",
+      });
+    } catch (err) {
+      if (!_retried) {
+        server.close();
+        appServer = null;
+        return runCodexResume(sessionId, prompt, cwd, true);
+      }
+      throw err;
+    }
     server.loadedThreads.add(sessionId);
   }
 
@@ -389,7 +437,7 @@ async function runCodexResume(sessionId, prompt, cwd) {
   return { sessionId, output: result.output };
 }
 
-async function runCodexReview(args) {
+async function runCodexReview(args, _retried = false) {
   if (!args?.mode) {
     throw new Error("codex-review requires mode");
   }
@@ -397,14 +445,24 @@ async function runCodexReview(args) {
   const cwd = path.resolve(args.cwd || process.cwd());
   const server = await getAppServer(cwd);
 
-  const { thread } = await server.request("thread/start", {
-    cwd,
-    sandbox: "read-only",
-    approvalPolicy: "never",
-    // Reviews are ephemeral — not persisted to disk, no session ID returned.
-    // Use codex (not codex-review) if follow-up discussion is needed.
-    ephemeral: true,
-  });
+  let thread;
+  try {
+    ({ thread } = await server.request("thread/start", {
+      cwd,
+      sandbox: "read-only",
+      approvalPolicy: "never",
+      // Reviews are ephemeral — not persisted to disk, no session ID returned.
+      // Use codex (not codex-review) if follow-up discussion is needed.
+      ephemeral: true,
+    }));
+  } catch (err) {
+    if (!_retried) {
+      server.close();
+      appServer = null;
+      return runCodexReview(args, true);
+    }
+    throw err;
+  }
 
   server.loadedThreads.add(thread.id);
 
