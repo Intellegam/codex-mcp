@@ -5,11 +5,11 @@
  *
  * MCP server that communicates with Codex via the app-server JSON-RPC protocol.
  * Spawns a single `codex app-server` process per MCP connection for reliable,
- * timeout-protected interaction with thread/session ID tracking.
+ * timeout-protected interaction with session tracking.
  *
  * Supports synchronous and asynchronous tool calls. Async calls (async: true)
- * return a jobId immediately; results are polled via `codex-result` and
- * cancelled via `codex-cancel`.
+ * return a sessionId immediately; the latest turn's state is polled via
+ * `codex-result` and cancelled via `codex-cancel`, both keyed by sessionId.
  */
 
 const { spawn } = require("child_process");
@@ -17,11 +17,12 @@ const crypto = require("crypto");
 const path = require("path");
 const readline = require("readline");
 
-const VERSION = "3.0.0";
+const VERSION = "3.1.0";
 const TIMEOUT_MS =
   parseInt(process.env.CODEX_TIMEOUT_MS, 10) || 30 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 5_000;
-const JOB_RESULT_WAIT_MAX_MS = 30_000;
+const RESULT_WAIT_MAX_MS = 30_000;
+const CANCEL_WATCHDOG_MS = 30_000;
 
 // ---------------------------------------------------------------------------
 // App Server Connection
@@ -203,8 +204,8 @@ class AppServerConnection {
     this.closed = true;
     const exitError = error || new Error("App server connection closed");
 
-    // Fail all jobs bound to this server (belt-and-suspenders with turn handler path)
-    failJobsForServer(this, exitError);
+    // Fail all turns bound to this server
+    failTurnsForServer(this, exitError);
 
     for (const pending of this.pending.values()) {
       pending.reject(exitError);
@@ -258,12 +259,19 @@ async function getAppServer(cwd) {
 }
 
 // ---------------------------------------------------------------------------
-// Job Engine
+// Turn & Session Engine
+//
+// Sessions represent Codex conversation threads. Each tool call creates a
+// turn within a session. The sessionId (== Codex threadId) is the only
+// user-facing identifier.
+//
+// Turn records track individual turns (one per codex/codex-reply/codex-review
+// invocation). They are internal — Claude only interacts via sessionId.
 // ---------------------------------------------------------------------------
 
-const jobs = new Map();
-const activeJobsByThread = new Map();
-// No counter — UUIDs prevent confusion across MCP restarts
+const turns = new Map(); // turn.id -> TurnRecord (internal)
+const sessions = new Map(); // sessionId -> SessionRecord (public-facing)
+const activeTurnsByThread = new Map(); // threadId -> turn.id
 
 const TERMINAL_STATES = new Set([
   "succeeded",
@@ -276,14 +284,16 @@ function isTerminal(status) {
   return TERMINAL_STATES.has(status);
 }
 
-function createJob({ toolName, cwd, timeoutMs }) {
-  const id = `job-${crypto.randomUUID()}`;
+// --- Turn record ---
+
+function createTurn({ toolName, cwd, timeoutMs }) {
+  const id = crypto.randomUUID(); // Internal only — not exposed to Claude
   const now = Date.now();
   let resolveDone;
   const donePromise = new Promise((resolve) => {
     resolveDone = resolve;
   });
-  const job = {
+  const turn = {
     id,
     toolName,
     status: "starting",
@@ -294,6 +304,8 @@ function createJob({ toolName, cwd, timeoutMs }) {
     timeoutMs,
     threadId: null,
     sessionId: null,
+    // The Codex app-server's turn ID, used for turn/interrupt.
+    // Not the same as turn.id (our internal record key).
     turnId: null,
     output: "",
     lastMessage: "",
@@ -304,128 +316,178 @@ function createJob({ toolName, cwd, timeoutMs }) {
     interruptPending: false,
     interruptSent: false,
     server: null,
-    waiters: new Set(),
     donePromise,
     resolveDone,
     cleanup: null,
   };
-  jobs.set(id, job);
-  return job;
+  turns.set(id, turn);
+  return turn;
 }
 
-function updateJob(job, patch) {
-  Object.assign(job, patch, { updatedAt: Date.now() });
-  notifyJobWaiters(job);
+function updateTurn(turn, patch) {
+  Object.assign(turn, patch, { updatedAt: Date.now() });
+  // Notify session waiters when turn state changes
+  if (turn.sessionId) {
+    const session = sessions.get(turn.sessionId);
+    if (session) notifySessionWaiters(session);
+  }
 }
 
-function settleJob(job, status, patch = {}) {
-  if (isTerminal(job.status)) return;
+function settleTurn(turn, status, patch = {}) {
+  if (isTerminal(turn.status)) return;
   const now = Date.now();
-  Object.assign(job, patch, {
+  Object.assign(turn, patch, {
     status,
     updatedAt: now,
     finishedAt: now,
     output:
-      patch.output ?? (job.reviewText || job.lastMessage || job.output || ""),
+      patch.output ?? (turn.reviewText || turn.lastMessage || turn.output || ""),
   });
-  if (job.cleanup) job.cleanup();
-  releaseThreadClaim(job); // Safety net — cleanup usually handles this
-  notifyJobWaiters(job);
-  job.resolveDone(job);
+  if (turn.cleanup) turn.cleanup();
+  releaseThreadClaim(turn);
+
+  // Clear active turn on session
+  if (turn.sessionId) {
+    const session = sessions.get(turn.sessionId);
+    if (session && session.activeTurnId === turn.id) {
+      session.activeTurnId = null;
+      session.updatedAt = now;
+    }
+    if (session) notifySessionWaiters(session);
+  }
+
+  turn.resolveDone(turn);
 }
 
-function failJob(job, err, source) {
-  settleJob(job, "failed", {
+function failTurn(turn, err, source) {
+  settleTurn(turn, "failed", {
     error: { message: err.message || String(err), source },
   });
 }
 
-function snapshotJob(job) {
+// --- Session record ---
+
+function getOrCreateSession(sessionId, cwd) {
+  let session = sessions.get(sessionId);
+  if (!session) {
+    const now = Date.now();
+    session = {
+      sessionId,
+      threadId: sessionId,
+      cwd: cwd || null,
+      createdAt: now,
+      updatedAt: now,
+      latestTurnId: null,
+      activeTurnId: null,
+      waiters: new Set(),
+    };
+    sessions.set(sessionId, session);
+  }
+  if (cwd) session.cwd = cwd;
+  return session;
+}
+
+function attachTurnToSession(session, turn) {
+  session.latestTurnId = turn.id;
+  session.activeTurnId = turn.id;
+  session.updatedAt = Date.now();
+  notifySessionWaiters(session);
+}
+
+function snapshotSession(session) {
+  const turn = turns.get(session.latestTurnId);
+  if (!turn) {
+    return {
+      sessionId: session.sessionId,
+      status: "unknown",
+      done: false,
+      error: { message: "No turn found for session", source: "internal" },
+    };
+  }
   return {
-    jobId: job.id,
-    toolName: job.toolName,
-    status: job.status,
-    done: isTerminal(job.status),
-    createdAt: new Date(job.createdAt).toISOString(),
-    finishedAt: job.finishedAt
-      ? new Date(job.finishedAt).toISOString()
+    sessionId: session.sessionId,
+    toolName: turn.toolName,
+    status: turn.status,
+    done: isTerminal(turn.status),
+    createdAt: new Date(turn.createdAt).toISOString(),
+    finishedAt: turn.finishedAt
+      ? new Date(turn.finishedAt).toISOString()
       : null,
-    elapsed: job.finishedAt
-      ? `${Math.round((job.finishedAt - job.createdAt) / 1000)}s`
-      : `${Math.round((Date.now() - job.createdAt) / 1000)}s (running)`,
-    sessionId: job.sessionId,
-    threadId: job.threadId,
-    cancelRequested: job.cancelRequested,
-    output: job.output || "",
-    error: job.error,
+    elapsed: turn.finishedAt
+      ? `${Math.round((turn.finishedAt - turn.createdAt) / 1000)}s`
+      : `${Math.round((Date.now() - turn.createdAt) / 1000)}s (running)`,
+    cancelRequested: turn.cancelRequested,
+    output: turn.output || "",
+    error: turn.error,
   };
 }
 
 // --- Thread guard ---
 
-function claimThread(threadId, job) {
-  const existingId = activeJobsByThread.get(threadId);
+function claimThread(threadId, turn) {
+  const existingId = activeTurnsByThread.get(threadId);
   if (existingId) {
-    const existing = jobs.get(existingId);
+    const existing = turns.get(existingId);
     if (existing && !isTerminal(existing.status)) {
       throw new Error(
-        `Thread ${threadId} already has active job ${existing.id} (${existing.status})`,
+        `Session ${threadId} already has an active turn (${existing.status})`,
       );
     }
   }
-  activeJobsByThread.set(threadId, job.id);
+  activeTurnsByThread.set(threadId, turn.id);
 }
 
-function releaseThreadClaim(job) {
-  if (job.threadId && activeJobsByThread.get(job.threadId) === job.id) {
-    activeJobsByThread.delete(job.threadId);
+function releaseThreadClaim(turn) {
+  if (turn.threadId && activeTurnsByThread.get(turn.threadId) === turn.id) {
+    activeTurnsByThread.delete(turn.threadId);
   }
 }
 
 // --- Cancel ---
 
-function requestJobCancel(job, reason = "user") {
-  if (isTerminal(job.status)) return job;
+function requestTurnCancel(turn, reason = "user") {
+  if (isTerminal(turn.status)) return turn;
 
-  if (!job.cancelRequested) {
-    job.cancelRequested = true;
-    job.cancelReason = reason;
+  if (!turn.cancelRequested) {
+    turn.cancelRequested = true;
+    turn.cancelReason = reason;
   }
 
   // Always transition to cancelling — even if turnId isn't known yet.
   // We keep the handler and thread claim alive until the start response
   // arrives (which gives us the turnId to interrupt) or the turn settles.
-  if (job.status !== "cancelling") updateJob(job, { status: "cancelling" });
+  if (turn.status !== "cancelling") updateTurn(turn, { status: "cancelling" });
 
-  if (job.turnId) {
-    maybeSendInterrupt(job);
+  if (turn.turnId) {
+    maybeSendInterrupt(turn);
   } else {
-    job.interruptPending = true;
+    turn.interruptPending = true;
   }
 
-  return job;
+  return turn;
 }
 
-const CANCEL_WATCHDOG_MS = 30_000; // Force-fail if cancelling doesn't settle within 30s
-
-function maybeSendInterrupt(job) {
-  if (job.interruptSent || !job.turnId || !job.server || job.server.closed)
+function maybeSendInterrupt(turn) {
+  if (turn.interruptSent || !turn.turnId || !turn.server || turn.server.closed)
     return;
-  job.interruptPending = false;
-  job.interruptSent = true;
-  job.server
-    .request("turn/interrupt", { threadId: job.threadId, turnId: job.turnId })
+  turn.interruptPending = false;
+  turn.interruptSent = true;
+  turn.server
+    .request("turn/interrupt", {
+      threadId: turn.threadId,
+      turnId: turn.turnId,
+    })
     .catch(() => {});
 
   // Watchdog: if the turn doesn't complete after interrupt, force-settle
   const watchdog = setTimeout(() => {
-    if (!isTerminal(job.status)) {
+    if (!isTerminal(turn.status)) {
       const terminalStatus =
-        job.cancelReason === "timeout" ? "timed_out" : "cancelled";
-      settleJob(job, terminalStatus, {
+        turn.cancelReason === "timeout" ? "timed_out" : "cancelled";
+      settleTurn(turn, terminalStatus, {
         error: {
           message: `Codex did not respond to interrupt within ${CANCEL_WATCHDOG_MS / 1000}s`,
-          source: job.cancelReason === "timeout" ? "timeout" : "cancel",
+          source: turn.cancelReason === "timeout" ? "timeout" : "cancel",
         },
       });
     }
@@ -435,72 +497,76 @@ function maybeSendInterrupt(job) {
 
 // --- Turn capture (background) ---
 
-function runTurnCapture(job, server, threadId, startFn) {
+function runTurnCapture(turn, server, threadId, startFn) {
   const timer = setTimeout(
-    () => requestJobCancel(job, "timeout"),
-    job.timeoutMs,
+    () => requestTurnCancel(turn, "timeout"),
+    turn.timeoutMs,
   );
   if (timer.unref) timer.unref();
 
-  job.server = server;
+  turn.server = server;
 
   const cleanup = () => {
     clearTimeout(timer);
     server.removeTurnHandler(threadId);
-    releaseThreadClaim(job);
-    job.cleanup = null;
+    releaseThreadClaim(turn);
+    turn.cleanup = null;
   };
-  job.cleanup = cleanup;
+  turn.cleanup = cleanup;
 
-  server.addTurnHandler(threadId, (msg) => handleTurnNotification(job, msg));
+  server.addTurnHandler(threadId, (msg) => handleTurnNotification(turn, msg));
 
   startFn()
-    .then((response) => handleStartResponse(job, response))
-    .catch((err) => failJob(job, err, "turn"));
+    .then((response) => handleStartResponse(turn, response))
+    .catch((err) => failTurn(turn, err, "turn"));
 }
 
-function handleStartResponse(job, response) {
-  if (isTerminal(job.status)) return;
+function handleStartResponse(turn, response) {
+  if (isTerminal(turn.status)) return;
 
-  const turnId = response?.turn?.id;
-  if (turnId) {
-    job.turnId = job.turnId || turnId;
-    if (job.interruptPending) maybeSendInterrupt(job);
+  const appTurnId = response?.turn?.id;
+  if (appTurnId) {
+    turn.turnId = turn.turnId || appTurnId;
+    if (turn.interruptPending) maybeSendInterrupt(turn);
   }
 
   // Check for immediately terminal turns
   if (response?.turn?.status && response.turn.status !== "inProgress") {
     const turnError = response.turn.error;
     if (response.turn.status === "failed" && turnError) {
-      failJob(job, new Error(turnError.message || "Codex turn failed"), "turn");
+      failTurn(
+        turn,
+        new Error(turnError.message || "Codex turn failed"),
+        "turn",
+      );
     } else {
-      settleJob(job, "succeeded");
+      settleTurn(turn, "succeeded");
     }
     return;
   }
 
-  if (job.status === "starting") {
-    updateJob(job, { status: "running" });
+  if (turn.status === "starting") {
+    updateTurn(turn, { status: "running" });
   }
 }
 
-function handleTurnNotification(job, msg) {
-  if (isTerminal(job.status)) return;
+function handleTurnNotification(turn, msg) {
+  if (isTerminal(turn.status)) return;
 
   switch (msg.method) {
     case "turn/started":
-      job.turnId = job.turnId || msg.params?.turn?.id;
-      if (job.interruptPending) maybeSendInterrupt(job);
-      if (job.status === "starting") updateJob(job, { status: "running" });
+      turn.turnId = turn.turnId || msg.params?.turn?.id;
+      if (turn.interruptPending) maybeSendInterrupt(turn);
+      if (turn.status === "starting") updateTurn(turn, { status: "running" });
       break;
 
     case "item/completed": {
       const item = msg.params?.item;
       if (item?.type === "agentMessage" && item.text) {
-        job.lastMessage = item.text;
+        turn.lastMessage = item.text;
       }
       if (item?.type === "exitedReviewMode" && item.review) {
-        job.reviewText = item.review;
+        turn.reviewText = item.review;
       }
       break;
     }
@@ -509,21 +575,21 @@ function handleTurnNotification(job, msg) {
       const turnStatus = msg.params?.turn?.status || "completed";
       const turnError = msg.params?.turn?.error;
       if (turnStatus === "failed" && turnError) {
-        failJob(
-          job,
+        failTurn(
+          turn,
           new Error(turnError.message || "Codex turn failed"),
           "turn",
         );
-      } else if (job.cancelRequested && job.interruptSent) {
+      } else if (turn.cancelRequested && turn.interruptSent) {
         // Interrupt was sent — treat completion as cancel/timeout
-        settleJob(
-          job,
-          job.cancelReason === "timeout" ? "timed_out" : "cancelled",
+        settleTurn(
+          turn,
+          turn.cancelReason === "timeout" ? "timed_out" : "cancelled",
           {
             error:
-              job.cancelReason === "timeout"
+              turn.cancelReason === "timeout"
                 ? {
-                    message: `Codex timed out after ${Math.round(job.timeoutMs / 1000)}s`,
+                    message: `Codex timed out after ${Math.round(turn.timeoutMs / 1000)}s`,
                     source: "timeout",
                   }
                 : null,
@@ -531,15 +597,15 @@ function handleTurnNotification(job, msg) {
         );
       } else {
         // Turn completed normally (even if cancel requested but not yet sent)
-        settleJob(job, "succeeded");
+        settleTurn(turn, "succeeded");
       }
       break;
     }
 
     case "error":
       if (msg.params?.willRetry) break;
-      failJob(
-        job,
+      failTurn(
+        turn,
         new Error(msg.params?.error?.message || "Codex error"),
         "turn",
       );
@@ -547,24 +613,25 @@ function handleTurnNotification(job, msg) {
   }
 }
 
-// --- Waiter support (long-poll for codex-result) ---
+// --- Session waiter support (long-poll for codex-result) ---
 
-function notifyJobWaiters(job) {
-  for (const waiter of job.waiters) {
+function notifySessionWaiters(session) {
+  for (const waiter of session.waiters) {
     waiter();
   }
-  job.waiters.clear();
+  session.waiters.clear();
 }
 
-function waitForJobChange(job, waitMs) {
+function waitForSessionChange(session, waitMs) {
   return new Promise((resolve) => {
-    if (isTerminal(job.status) || waitMs <= 0) {
+    const turn = turns.get(session.latestTurnId);
+    if (!turn || isTerminal(turn.status) || waitMs <= 0) {
       resolve();
       return;
     }
-    const cappedMs = Math.min(waitMs, JOB_RESULT_WAIT_MAX_MS);
+    const cappedMs = Math.min(waitMs, RESULT_WAIT_MAX_MS);
     const timer = setTimeout(() => {
-      job.waiters.delete(waiter);
+      session.waiters.delete(waiter);
       resolve();
     }, cappedMs);
     if (timer.unref) timer.unref();
@@ -572,51 +639,51 @@ function waitForJobChange(job, waitMs) {
       clearTimeout(timer);
       resolve();
     };
-    job.waiters.add(waiter);
+    session.waiters.add(waiter);
   });
 }
 
 // --- App server exit hook ---
 
-function failJobsForServer(server, error) {
-  for (const job of jobs.values()) {
-    if (job.server !== server) continue;
-    if (isTerminal(job.status)) continue;
-    failJob(job, error, "app-server");
+function failTurnsForServer(server, error) {
+  for (const turn of turns.values()) {
+    if (turn.server !== server) continue;
+    if (isTerminal(turn.status)) continue;
+    failTurn(turn, error, "app-server");
   }
 }
 
-function hasActiveJobsOnServer(server) {
+function hasActiveTurnsOnServer(server) {
   if (server.setupCount > 0) return true;
-  for (const job of jobs.values()) {
-    if (job.server !== server) continue;
-    if (!isTerminal(job.status)) return true;
+  for (const turn of turns.values()) {
+    if (turn.server !== server) continue;
+    if (!isTerminal(turn.status)) return true;
   }
   return false;
 }
 
-// Retry server connection only if no other jobs are using it
+// Retry server connection only if no other turns are using it
 function retryableServerClose(server) {
-  if (hasActiveJobsOnServer(server)) return false;
+  if (hasActiveTurnsOnServer(server)) return false;
   server.close();
   appServer = null;
   return true;
 }
 
 // ---------------------------------------------------------------------------
-// Job submissions
+// Turn submissions
 // ---------------------------------------------------------------------------
 
-async function submitCodexStartJob(args) {
+async function submitCodexStart(args) {
   const cwd = path.resolve(args.cwd || process.cwd());
-  const job = createJob({ toolName: "codex", cwd, timeoutMs: TIMEOUT_MS });
+  const turn = createTurn({ toolName: "codex", cwd, timeoutMs: TIMEOUT_MS });
 
   let server;
   try {
     server = await getAppServer(cwd);
   } catch (err) {
-    failJob(job, err, "setup");
-    return job;
+    failTurn(turn, err, "setup");
+    return turn;
   }
 
   const threadStartParams = {
@@ -632,66 +699,69 @@ async function submitCodexStartJob(args) {
     ({ thread } = await server.request("thread/start", threadStartParams));
   } catch (err) {
     server.setupCount--;
-    // Retry once with fresh connection if no other jobs are using it
     if (!retryableServerClose(server)) {
-      failJob(job, err, "setup");
-      return job;
+      failTurn(turn, err, "setup");
+      return turn;
     }
-    server = await getAppServer(cwd).catch((e) => null);
+    server = await getAppServer(cwd).catch(() => null);
     if (!server) {
-      failJob(job, err, "setup");
-      return job;
+      failTurn(turn, err, "setup");
+      return turn;
     }
     server.setupCount++;
     try {
       ({ thread } = await server.request("thread/start", threadStartParams));
     } catch (retryErr) {
       server.setupCount--;
-      failJob(job, retryErr, "setup");
-      return job;
+      failTurn(turn, retryErr, "setup");
+      return turn;
     }
   }
   server.setupCount--;
 
   server.loadedThreads.add(thread.id);
-  job.threadId = thread.id;
-  job.sessionId = thread.id;
+  turn.threadId = thread.id;
+  turn.sessionId = thread.id;
+
+  // Create session and attach turn synchronously before any async work
+  const session = getOrCreateSession(thread.id, cwd);
+  attachTurnToSession(session, turn);
 
   try {
-    claimThread(thread.id, job);
+    claimThread(thread.id, turn);
   } catch (err) {
-    failJob(job, err, "setup");
-    return job;
+    failTurn(turn, err, "setup");
+    return turn;
   }
 
-  runTurnCapture(job, server, thread.id, () =>
+  runTurnCapture(turn, server, thread.id, () =>
     server.request("turn/start", {
       threadId: thread.id,
       input: [{ type: "text", text: args.prompt }],
     }),
   );
 
-  return job;
+  return turn;
 }
 
-async function submitCodexResumeJob(args) {
+async function submitCodexResume(args) {
   const sessionId = args.sessionId;
   const prompt = args.prompt;
   const cwd = path.resolve(args.cwd || process.cwd());
-  const job = createJob({
+  const turn = createTurn({
     toolName: "codex-reply",
     cwd,
     timeoutMs: TIMEOUT_MS,
   });
-  job.threadId = sessionId;
-  job.sessionId = sessionId;
+  turn.threadId = sessionId;
+  turn.sessionId = sessionId;
 
   let server;
   try {
     server = await getAppServer(cwd);
   } catch (err) {
-    failJob(job, err, "setup");
-    return job;
+    failTurn(turn, err, "setup");
+    return turn;
   }
 
   if (!server.loadedThreads.has(sessionId)) {
@@ -705,13 +775,13 @@ async function submitCodexResumeJob(args) {
     } catch (err) {
       server.setupCount--;
       if (!retryableServerClose(server)) {
-        failJob(job, err, "setup");
-        return job;
+        failTurn(turn, err, "setup");
+        return turn;
       }
       server = await getAppServer(cwd).catch(() => null);
       if (!server) {
-        failJob(job, err, "setup");
-        return job;
+        failTurn(turn, err, "setup");
+        return turn;
       }
       server.setupCount++;
       try {
@@ -722,8 +792,8 @@ async function submitCodexResumeJob(args) {
         });
       } catch (retryErr) {
         server.setupCount--;
-        failJob(job, retryErr, "setup");
-        return job;
+        failTurn(turn, retryErr, "setup");
+        return turn;
       }
     }
     server.setupCount--;
@@ -731,33 +801,40 @@ async function submitCodexResumeJob(args) {
   }
 
   try {
-    claimThread(sessionId, job);
+    claimThread(sessionId, turn);
   } catch (err) {
-    failJob(job, err, "setup");
-    return job;
+    failTurn(turn, err, "setup");
+    return turn;
   }
 
-  runTurnCapture(job, server, sessionId, () =>
+  // Create/get session and attach turn AFTER claimThread succeeds.
+  // Creating earlier would leave a stale session record on failed resume.
+  // Attaching earlier would overwrite the session's latestTurnId, making
+  // the real running turn unobservable if this setup fails.
+  const session = getOrCreateSession(sessionId, cwd);
+  attachTurnToSession(session, turn);
+
+  runTurnCapture(turn, server, sessionId, () =>
     server.request("turn/start", {
       threadId: sessionId,
       input: [{ type: "text", text: prompt }],
     }),
   );
 
-  return job;
+  return turn;
 }
 
-async function submitCodexReviewJob(args) {
+async function submitCodexReview(args) {
   const cwd = path.resolve(args.cwd || process.cwd());
-  const job = createJob({
+  const turn = createTurn({
     toolName: "codex-review",
     cwd,
     timeoutMs: TIMEOUT_MS,
   });
 
   if (!args?.mode) {
-    failJob(job, new Error("codex-review requires mode"), "setup");
-    return job;
+    failTurn(turn, new Error("codex-review requires mode"), "setup");
+    return turn;
   }
 
   // Validate review args before creating any threads
@@ -784,16 +861,16 @@ async function submitCodexReviewJob(args) {
         throw new Error(`Unknown review mode: ${args.mode}`);
     }
   } catch (err) {
-    failJob(job, err, "setup");
-    return job;
+    failTurn(turn, err, "setup");
+    return turn;
   }
 
   let server;
   try {
     server = await getAppServer(cwd);
   } catch (err) {
-    failJob(job, err, "setup");
-    return job;
+    failTurn(turn, err, "setup");
+    return turn;
   }
 
   const threadStartParams = {
@@ -810,37 +887,41 @@ async function submitCodexReviewJob(args) {
   } catch (err) {
     server.setupCount--;
     if (!retryableServerClose(server)) {
-      failJob(job, err, "setup");
-      return job;
+      failTurn(turn, err, "setup");
+      return turn;
     }
     server = await getAppServer(cwd).catch(() => null);
     if (!server) {
-      failJob(job, err, "setup");
-      return job;
+      failTurn(turn, err, "setup");
+      return turn;
     }
     server.setupCount++;
     try {
       ({ thread } = await server.request("thread/start", threadStartParams));
     } catch (retryErr) {
       server.setupCount--;
-      failJob(job, retryErr, "setup");
-      return job;
+      failTurn(turn, retryErr, "setup");
+      return turn;
     }
   }
   server.setupCount--;
 
   server.loadedThreads.add(thread.id);
-  job.threadId = thread.id;
-  job.sessionId = thread.id;
+  turn.threadId = thread.id;
+  turn.sessionId = thread.id;
+
+  // Create session and attach turn synchronously
+  const session = getOrCreateSession(thread.id, cwd);
+  attachTurnToSession(session, turn);
 
   try {
-    claimThread(thread.id, job);
+    claimThread(thread.id, turn);
   } catch (err) {
-    failJob(job, err, "setup");
-    return job;
+    failTurn(turn, err, "setup");
+    return turn;
   }
 
-  runTurnCapture(job, server, thread.id, () =>
+  runTurnCapture(turn, server, thread.id, () =>
     server.request("review/start", {
       threadId: thread.id,
       target,
@@ -848,7 +929,7 @@ async function submitCodexReviewJob(args) {
     }),
   );
 
-  return job;
+  return turn;
 }
 
 // ---------------------------------------------------------------------------
@@ -856,56 +937,61 @@ async function submitCodexReviewJob(args) {
 // ---------------------------------------------------------------------------
 
 async function runCodexStart(args) {
-  const job = await submitCodexStartJob(args);
-  if (!isTerminal(job.status)) await job.donePromise;
-  jobs.delete(job.id); // Sync jobs are not pollable — evict immediately
-  if (job.status !== "succeeded") {
-    throw new Error(job.error?.message || `Codex ${job.status}`);
+  const turn = await submitCodexStart(args);
+  if (!isTerminal(turn.status)) await turn.donePromise;
+  if (turn.status !== "succeeded") {
+    throw new Error(turn.error?.message || `Codex ${turn.status}`);
   }
-  return { sessionId: job.sessionId, output: job.output };
+  return { sessionId: turn.sessionId, output: turn.output };
 }
 
 async function runCodexResume(args) {
-  const job = await submitCodexResumeJob(args);
-  if (!isTerminal(job.status)) await job.donePromise;
-  jobs.delete(job.id);
-  if (job.status !== "succeeded") {
-    throw new Error(job.error?.message || `Codex ${job.status}`);
+  const turn = await submitCodexResume(args);
+  if (!isTerminal(turn.status)) await turn.donePromise;
+  if (turn.status !== "succeeded") {
+    throw new Error(turn.error?.message || `Codex ${turn.status}`);
   }
-  return { sessionId: job.sessionId, output: job.output };
+  return { sessionId: turn.sessionId, output: turn.output };
 }
 
 async function runCodexReview(args) {
-  const job = await submitCodexReviewJob(args);
-  if (!isTerminal(job.status)) await job.donePromise;
-  jobs.delete(job.id);
-  if (job.status !== "succeeded") {
-    throw new Error(job.error?.message || `Codex ${job.status}`);
+  const turn = await submitCodexReview(args);
+  if (!isTerminal(turn.status)) await turn.donePromise;
+  if (turn.status !== "succeeded") {
+    throw new Error(turn.error?.message || `Codex ${turn.status}`);
   }
-  return { sessionId: job.sessionId, output: job.output };
+  return { sessionId: turn.sessionId, output: turn.output };
 }
 
 // ---------------------------------------------------------------------------
 // Async tool implementations
 // ---------------------------------------------------------------------------
 
-async function runCodexResult({ jobId, waitMs = 0 }) {
-  const job = jobs.get(jobId);
-  if (!job) throw new Error("Unknown or expired jobId");
+async function runCodexResult({ sessionId, waitMs = 0 }) {
+  const session = sessions.get(sessionId);
+  if (!session) throw new Error("Unknown sessionId");
 
-  if (!isTerminal(job.status) && waitMs > 0) {
-    await waitForJobChange(job, waitMs);
+  const turn = turns.get(session.latestTurnId);
+  if (turn && !isTerminal(turn.status) && waitMs > 0) {
+    await waitForSessionChange(session, waitMs);
   }
 
-  return snapshotJob(job);
+  return snapshotSession(session);
 }
 
-function runCodexCancel({ jobId }) {
-  const job = jobs.get(jobId);
-  if (!job) throw new Error("Unknown or expired jobId");
+function runCodexCancel({ sessionId }) {
+  const session = sessions.get(sessionId);
+  if (!session) throw new Error("Unknown sessionId");
 
-  requestJobCancel(job, "user");
-  return snapshotJob(job);
+  // Cancel the active turn if there is one
+  if (session.activeTurnId) {
+    const turn = turns.get(session.activeTurnId);
+    if (turn && !isTerminal(turn.status)) {
+      requestTurnCancel(turn, "user");
+    }
+  }
+
+  return snapshotSession(session);
 }
 
 // ---------------------------------------------------------------------------
@@ -982,7 +1068,7 @@ function handleToolsList(message) {
             async: {
               type: "boolean",
               description:
-                "Run asynchronously. Returns a jobId immediately instead of blocking. Use `codex-result` to poll for the result and `codex-cancel` to cancel. Use when you have other work to do in parallel — if you would just poll in a loop, use sync (the default) instead.",
+                "Run asynchronously. Returns a sessionId immediately instead of blocking. Use `codex-result` to poll the latest turn state and `codex-cancel` to cancel. Use when you have other work to do in parallel — if you would just poll in a loop, use sync (the default) instead.",
             },
           },
           required: ["prompt"],
@@ -998,7 +1084,7 @@ function handleToolsList(message) {
             sessionId: {
               type: "string",
               description:
-                "Session ID from a previous codex or codex-reply call",
+                "Session ID from a previous codex, codex-reply, or codex-review call",
             },
             prompt: { type: "string", description: "Follow-up prompt" },
             cwd: {
@@ -1009,7 +1095,7 @@ function handleToolsList(message) {
             async: {
               type: "boolean",
               description:
-                "Run asynchronously. Returns a jobId immediately instead of blocking. Use `codex-result` to poll for the result and `codex-cancel` to cancel.",
+                "Run asynchronously. Returns the same sessionId immediately. Use `codex-result` to poll the latest turn state and `codex-cancel` to cancel.",
             },
           },
           required: ["sessionId", "prompt"],
@@ -1051,7 +1137,7 @@ function handleToolsList(message) {
             async: {
               type: "boolean",
               description:
-                "Run asynchronously. Returns a jobId immediately instead of blocking. Use `codex-result` to poll for the result and `codex-cancel` to cancel.",
+                "Run asynchronously. Returns a new sessionId immediately. Use `codex-result` to poll the review turn and `codex-cancel` to cancel.",
             },
           },
           required: ["mode"],
@@ -1060,37 +1146,38 @@ function handleToolsList(message) {
       {
         name: "codex-result",
         description:
-          "Get the status or result of an async Codex job. Returns the current job snapshot. Use `waitMs` for long-polling — the call blocks until the job changes state or the wait expires.",
+          "Get the latest turn status or result for a Codex session. Use `waitMs` for long-polling — blocks until the turn changes state or the wait expires. Works for any session started by codex, codex-reply, or codex-review.",
         inputSchema: {
           type: "object",
           properties: {
-            jobId: {
+            sessionId: {
               type: "string",
-              description: "Job ID from a previous async codex call",
+              description:
+                "Session ID to check",
             },
             waitMs: {
               type: "integer",
               minimum: 0,
-              maximum: JOB_RESULT_WAIT_MAX_MS,
-              description: `Optional long-poll timeout in milliseconds (max ${JOB_RESULT_WAIT_MAX_MS / 1000}s). If the job is still running, waits up to this long for a state change before returning.`,
+              maximum: RESULT_WAIT_MAX_MS,
+              description: `Optional long-poll timeout in milliseconds (max ${RESULT_WAIT_MAX_MS / 1000}s). If the latest turn is still active, waits up to this long for a state change before returning.`,
             },
           },
-          required: ["jobId"],
+          required: ["sessionId"],
         },
       },
       {
         name: "codex-cancel",
         description:
-          "Cancel a running async Codex job. If the job is still in progress, requests cancellation. If already completed, returns the current state unchanged.",
+          "Cancel the active turn on a Codex session. If a turn is still in progress, requests cancellation. If no active turn or already completed, returns the current state unchanged.",
         inputSchema: {
           type: "object",
           properties: {
-            jobId: {
+            sessionId: {
               type: "string",
-              description: "Job ID to cancel",
+              description: "Session ID whose active turn should be cancelled",
             },
           },
-          required: ["jobId"],
+          required: ["sessionId"],
         },
       },
     ],
@@ -1102,23 +1189,38 @@ async function handleToolCall(message) {
 
   try {
     // --- Async submissions ---
-    if ((name === "codex" || name === "codex-reply" || name === "codex-review") && args.async) {
-      let job;
+    if (
+      (name === "codex" ||
+        name === "codex-reply" ||
+        name === "codex-review") &&
+      args.async
+    ) {
+      let turn;
       if (name === "codex") {
-        job = await submitCodexStartJob(args);
+        turn = await submitCodexStart(args);
       } else if (name === "codex-reply") {
-        job = await submitCodexResumeJob(args);
+        turn = await submitCodexResume(args);
       } else {
-        job = await submitCodexReviewJob(args);
+        turn = await submitCodexReview(args);
       }
-      const snapshot = snapshotJob(job);
+      // If the turn failed before being attached to a session (e.g., thread
+      // guard rejection), show the turn's error directly. Otherwise show the
+      // session's latest turn state.
+      const session = sessions.get(turn.sessionId);
+      const isAttached = session && session.latestTurnId === turn.id;
+      const snapshot =
+        isTerminal(turn.status) && !isAttached
+          ? snapshotFallback(turn)
+          : session
+            ? snapshotSession(session)
+            : snapshotFallback(turn);
       sendResponse(message.id, {
         content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
       });
       return;
     }
 
-    // --- New async tools ---
+    // --- Session tools ---
     if (name === "codex-result") {
       const snapshot = await runCodexResult(args);
       sendResponse(message.id, {
@@ -1160,6 +1262,26 @@ async function handleToolCall(message) {
   } catch (e) {
     sendError(message.id, -32603, e.message);
   }
+}
+
+// Fallback snapshot when turn failed before session was created
+function snapshotFallback(turn) {
+  return {
+    sessionId: turn.sessionId,
+    toolName: turn.toolName,
+    status: turn.status,
+    done: isTerminal(turn.status),
+    createdAt: new Date(turn.createdAt).toISOString(),
+    finishedAt: turn.finishedAt
+      ? new Date(turn.finishedAt).toISOString()
+      : null,
+    elapsed: turn.finishedAt
+      ? `${Math.round((turn.finishedAt - turn.createdAt) / 1000)}s`
+      : `${Math.round((Date.now() - turn.createdAt) / 1000)}s (running)`,
+    cancelRequested: turn.cancelRequested,
+    output: turn.output || "",
+    error: turn.error,
+  };
 }
 
 // ---------------------------------------------------------------------------

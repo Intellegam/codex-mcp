@@ -103,7 +103,7 @@ describe("MCP protocol", () => {
     server = spawnServer();
     const resp = await server.mcpInit();
     expect(resp.result.serverInfo.name).toBe("codex-cli-wrapper");
-    expect(resp.result.serverInfo.version).toBe("3.0.0");
+    expect(resp.result.serverInfo.version).toBe("3.1.0");
     expect(resp.result.protocolVersion).toBe("2024-11-05");
   });
 
@@ -209,7 +209,6 @@ describe("codex-review tool", () => {
     const resp = await server.waitResponse();
     expect(resp.error).toBeUndefined();
     expect(resp.result.content[0].text).toContain("Mock review: code looks good.");
-    // Reviews now return session IDs like other tools
     expect(resp.result.content[1].text).toMatch(/SESSION_ID:/);
   });
 
@@ -263,7 +262,6 @@ describe("timeout and error handling", () => {
   afterEach(() => server?.close());
 
   test("times out and returns error", async () => {
-    // Use a very long turn delay so it exceeds our 3s test timeout
     server = spawnServer({ MOCK_TURN_DELAY_MS: "60000", CODEX_TIMEOUT_MS: "500" });
     await server.mcpInit();
     server.send({
@@ -284,13 +282,12 @@ describe("timeout and error handling", () => {
     });
     const resp = await server.waitResponse(5000);
     expect(resp.error).toBeDefined();
-    // Should fail fast, not wait for the full 3s timeout
     expect(resp.error.message).not.toContain("timed out");
   });
 });
 
 // -------------------------------------------------------------------------
-// Helpers for async tests
+// Helpers for async tests — all keyed by sessionId (the only user-facing ID)
 // -------------------------------------------------------------------------
 
 function parseSnapshot(resp) {
@@ -303,28 +300,27 @@ async function asyncCall(server, id, name, args) {
   return server.waitResponse();
 }
 
-async function pollUntilStatus(server, jobId, targetStatus, idStart = 100) {
+async function pollUntilStatus(server, sessionId, targetStatus, idStart = 100) {
   let id = idStart;
   for (let i = 0; i < 50; i++) {
-    const resp = await asyncCall(server, id++, "codex-result", { jobId });
+    const resp = await asyncCall(server, id++, "codex-result", { sessionId });
     const snap = parseSnapshot(resp);
     if (snap.status === targetStatus || snap.done) return snap;
-    // Short poll
-    const pollResp = await asyncCall(server, id++, "codex-result", { jobId, waitMs: 200 });
+    const pollResp = await asyncCall(server, id++, "codex-result", { sessionId, waitMs: 200 });
     const pollSnap = parseSnapshot(pollResp);
     if (pollSnap.status === targetStatus || pollSnap.done) return pollSnap;
   }
-  throw new Error(`Job ${jobId} never reached status ${targetStatus}`);
+  throw new Error(`Session ${sessionId} never reached status ${targetStatus}`);
 }
 
-async function pollUntilDone(server, jobId, idStart = 100) {
+async function pollUntilDone(server, sessionId, idStart = 100) {
   let id = idStart;
   for (let i = 0; i < 50; i++) {
-    const resp = await asyncCall(server, id++, "codex-result", { jobId, waitMs: 500 });
+    const resp = await asyncCall(server, id++, "codex-result", { sessionId, waitMs: 500 });
     const snap = parseSnapshot(resp);
     if (snap.done) return snap;
   }
-  throw new Error(`Job ${jobId} never completed`);
+  throw new Error(`Session ${sessionId} never completed`);
 }
 
 // -------------------------------------------------------------------------
@@ -339,14 +335,12 @@ describe("async codex", () => {
 
     const resp = await asyncCall(server, 1, "codex", { prompt: "async hello", async: true });
     const snap = parseSnapshot(resp);
-    expect(snap.jobId).toBeDefined();
+    expect(snap.sessionId).toBeDefined();
     expect(snap.toolName).toBe("codex");
     expect(snap.done).toBe(false);
-    expect(snap.sessionId).toBeDefined();
     expect(snap.output).toBe("");
 
-    const final = await pollUntilDone(server, snap.jobId);
-    expect(final.jobId).toBe(snap.jobId);
+    const final = await pollUntilDone(server, snap.sessionId);
     expect(final.status).toBe("succeeded");
     expect(final.done).toBe(true);
     expect(final.sessionId).toBe(snap.sessionId);
@@ -361,16 +355,15 @@ describe("async codex", () => {
     const resp = await asyncCall(server, 1, "codex", { prompt: "wait test", async: true });
     const snap = parseSnapshot(resp);
 
-    // Poll until running so waitMs doesn't wake on starting->running
-    await pollUntilStatus(server, snap.jobId, "running");
+    await pollUntilStatus(server, snap.sessionId, "running");
 
     const before = Date.now();
-    const pollResp = await asyncCall(server, 200, "codex-result", { jobId: snap.jobId, waitMs: 5000 });
+    const pollResp = await asyncCall(server, 200, "codex-result", { sessionId: snap.sessionId, waitMs: 5000 });
     const elapsed = Date.now() - before;
     const final = parseSnapshot(pollResp);
 
     expect(final.status).toBe("succeeded");
-    expect(elapsed).toBeLessThan(4500); // returned well before 5s wait
+    expect(elapsed).toBeLessThan(4500);
   });
 
   test("codex-result waitMs times out and returns running snapshot", async () => {
@@ -380,10 +373,10 @@ describe("async codex", () => {
     const resp = await asyncCall(server, 1, "codex", { prompt: "slow", async: true });
     const snap = parseSnapshot(resp);
 
-    await pollUntilStatus(server, snap.jobId, "running");
+    await pollUntilStatus(server, snap.sessionId, "running");
 
     const before = Date.now();
-    const pollResp = await asyncCall(server, 200, "codex-result", { jobId: snap.jobId, waitMs: 100 });
+    const pollResp = await asyncCall(server, 200, "codex-result", { sessionId: snap.sessionId, waitMs: 100 });
     const elapsed = Date.now() - before;
     const current = parseSnapshot(pollResp);
 
@@ -392,9 +385,9 @@ describe("async codex", () => {
     expect(elapsed).toBeGreaterThanOrEqual(80);
     expect(elapsed).toBeLessThan(1000);
 
-    // Cleanup: cancel the long job
-    await asyncCall(server, 300, "codex-cancel", { jobId: snap.jobId });
-    await pollUntilDone(server, snap.jobId, 400);
+    // Cleanup
+    await asyncCall(server, 300, "codex-cancel", { sessionId: snap.sessionId });
+    await pollUntilDone(server, snap.sessionId, 400);
   });
 
   test("cancel while running", async () => {
@@ -404,13 +397,13 @@ describe("async codex", () => {
     const resp = await asyncCall(server, 1, "codex", { prompt: "cancel me", async: true });
     const snap = parseSnapshot(resp);
 
-    await pollUntilStatus(server, snap.jobId, "running");
+    await pollUntilStatus(server, snap.sessionId, "running");
 
-    const cancelResp = await asyncCall(server, 200, "codex-cancel", { jobId: snap.jobId });
+    const cancelResp = await asyncCall(server, 200, "codex-cancel", { sessionId: snap.sessionId });
     const cancelSnap = parseSnapshot(cancelResp);
     expect(cancelSnap.cancelRequested).toBe(true);
 
-    const final = await pollUntilDone(server, snap.jobId, 300);
+    const final = await pollUntilDone(server, snap.sessionId, 300);
     expect(final.status).toBe("cancelled");
     expect(final.done).toBe(true);
     expect(final.cancelRequested).toBe(true);
@@ -424,25 +417,25 @@ describe("async codex", () => {
     const resp = await asyncCall(server, 1, "codex", { prompt: "fast", async: true });
     const snap = parseSnapshot(resp);
 
-    const final = await pollUntilDone(server, snap.jobId);
+    const final = await pollUntilDone(server, snap.sessionId);
     expect(final.status).toBe("succeeded");
 
-    const cancelResp = await asyncCall(server, 200, "codex-cancel", { jobId: snap.jobId });
+    const cancelResp = await asyncCall(server, 200, "codex-cancel", { sessionId: snap.sessionId });
     const cancelSnap = parseSnapshot(cancelResp);
     expect(cancelSnap.status).toBe("succeeded");
     expect(cancelSnap.cancelRequested).toBe(false);
   });
 
-  test("thread guard rejects concurrent job on same thread", async () => {
+  test("thread guard rejects concurrent turn on same session", async () => {
     server = spawnServer({ MOCK_TURN_DELAY_MS: "5000" });
     await server.mcpInit();
 
     const resp1 = await asyncCall(server, 1, "codex", { prompt: "first", async: true });
     const snap1 = parseSnapshot(resp1);
 
-    await pollUntilStatus(server, snap1.jobId, "running");
+    await pollUntilStatus(server, snap1.sessionId, "running");
 
-    // Try a codex-reply on the same session while job 1 is running
+    // Try a codex-reply on the same session while turn 1 is running
     const resp2 = await asyncCall(server, 2, "codex-reply", {
       sessionId: snap1.sessionId, prompt: "second", async: true,
     });
@@ -450,23 +443,23 @@ describe("async codex", () => {
     expect(snap2.status).toBe("failed");
     expect(snap2.done).toBe(true);
     expect(snap2.error.source).toBe("setup");
-    expect(snap2.error.message).toContain("already has active job");
+    expect(snap2.error.message).toContain("already has an active turn");
 
     // Cleanup
-    await asyncCall(server, 300, "codex-cancel", { jobId: snap1.jobId });
-    await pollUntilDone(server, snap1.jobId, 400);
+    await asyncCall(server, 300, "codex-cancel", { sessionId: snap1.sessionId });
+    await pollUntilDone(server, snap1.sessionId, 400);
   });
 
-  test("async job timeout becomes timed_out", async () => {
+  test("async turn timeout becomes timed_out", async () => {
     server = spawnServer({ MOCK_TURN_DELAY_MS: "60000", CODEX_TIMEOUT_MS: "500" });
     await server.mcpInit();
 
     const resp = await asyncCall(server, 1, "codex", { prompt: "will timeout", async: true });
     const snap = parseSnapshot(resp);
-    expect(snap.jobId).toBeDefined();
+    expect(snap.sessionId).toBeDefined();
     expect(snap.done).toBe(false);
 
-    const final = await pollUntilDone(server, snap.jobId);
+    const final = await pollUntilDone(server, snap.sessionId);
     expect(final.status).toBe("timed_out");
     expect(final.done).toBe(true);
     expect(final.cancelRequested).toBe(true);
@@ -478,28 +471,28 @@ describe("async error handling", () => {
   let server;
   afterEach(() => server?.close());
 
-  test("codex-result rejects unknown jobId", async () => {
+  test("codex-result rejects unknown sessionId", async () => {
     server = spawnServer();
     await server.mcpInit();
     server.send({
       jsonrpc: "2.0", id: 1, method: "tools/call",
-      params: { name: "codex-result", arguments: { jobId: "job-does-not-exist" } },
+      params: { name: "codex-result", arguments: { sessionId: "does-not-exist" } },
     });
     const resp = await server.waitResponse();
     expect(resp.error).toBeDefined();
-    expect(resp.error.message).toContain("Unknown or expired jobId");
+    expect(resp.error.message).toContain("Unknown sessionId");
   });
 
-  test("codex-cancel rejects unknown jobId", async () => {
+  test("codex-cancel rejects unknown sessionId", async () => {
     server = spawnServer();
     await server.mcpInit();
     server.send({
       jsonrpc: "2.0", id: 1, method: "tools/call",
-      params: { name: "codex-cancel", arguments: { jobId: "job-does-not-exist" } },
+      params: { name: "codex-cancel", arguments: { sessionId: "does-not-exist" } },
     });
     const resp = await server.waitResponse();
     expect(resp.error).toBeDefined();
-    expect(resp.error.message).toContain("Unknown or expired jobId");
+    expect(resp.error.message).toContain("Unknown sessionId");
   });
 
   test("async review with invalid args returns failed snapshot", async () => {
@@ -513,6 +506,5 @@ describe("async error handling", () => {
     expect(snap.error.source).toBe("setup");
     expect(snap.error.message).toContain("codex-review requires mode");
     expect(snap.sessionId).toBeNull();
-    expect(snap.threadId).toBeNull();
   });
 });

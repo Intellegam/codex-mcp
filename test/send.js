@@ -11,9 +11,9 @@
  *   node test/send.js codex-review base main
  *   node test/send.js codex-review commit abc123
  *   node test/send.js codex-review custom "Focus on security"
- *   node test/send.js codex-result <jobId>
- *   node test/send.js codex-result <jobId> --wait 10000
- *   node test/send.js codex-cancel <jobId>
+ *   node test/send.js codex-result <sessionId>
+ *   node test/send.js codex-result <sessionId> --wait 10000
+ *   node test/send.js codex-cancel <sessionId>
  */
 
 const { spawn } = require("child_process");
@@ -37,9 +37,9 @@ if (!tool || tool === "--help" || tool === "-h") {
   console.log("  node test/send.js codex-review base <branch>");
   console.log("  node test/send.js codex-review commit <sha>");
   console.log('  node test/send.js codex-review custom "instructions"');
-  console.log("  node test/send.js codex-result <jobId>");
-  console.log("  node test/send.js codex-result <jobId> --wait 10000");
-  console.log("  node test/send.js codex-cancel <jobId>");
+  console.log("  node test/send.js codex-result <sessionId>");
+  console.log("  node test/send.js codex-result <sessionId> --wait 10000");
+  console.log("  node test/send.js codex-cancel <sessionId>");
   process.exit(0);
 }
 
@@ -69,13 +69,13 @@ function buildArgs() {
       return args;
     }
     case "codex-result": {
-      const args = { jobId: rest[0] };
+      const args = { sessionId: rest[0] };
       const waitIdx = rest.indexOf("--wait");
       if (waitIdx !== -1) args.waitMs = parseInt(rest[waitIdx + 1], 10);
       return args;
     }
     case "codex-cancel":
-      return { jobId: rest[0] };
+      return { sessionId: rest[0] };
     default:
       console.error(`Unknown tool: ${tool}`);
       process.exit(1);
@@ -152,11 +152,11 @@ async function main() {
     console.log(block.text);
   }
 
-  // For async calls, poll codex-result until the job completes
+  // For async calls, poll codex-result until the turn completes
   if (isAsync) {
     const snapshot = JSON.parse(resp.result.content[0].text);
     if (!snapshot.done) {
-      console.error(`\n→ Polling codex-result (jobId: ${snapshot.jobId})...\n`);
+      console.error(`\n→ Polling codex-result (sessionId: ${snapshot.sessionId})...\n`);
       let result = snapshot;
       while (!result.done) {
         send({
@@ -165,7 +165,7 @@ async function main() {
           method: "tools/call",
           params: {
             name: "codex-result",
-            arguments: { jobId: result.jobId, waitMs: 30000 },
+            arguments: { sessionId: result.sessionId, waitMs: 30000 },
           },
         });
         const pollResp = await wait(60000);

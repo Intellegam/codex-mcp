@@ -10,7 +10,7 @@ An MCP server that communicates with Codex via the [app-server](https://develope
 4. Collects streaming notifications until `turn/completed`
 5. Returns response text and `[SESSION_ID: xxx]` (the Codex thread ID) to the client
 6. Enforces configurable timeouts (default 30 minutes) to prevent indefinite hangs
-7. Supports async mode — return a job ID immediately and poll for results
+7. Supports async mode — return a sessionId immediately and poll for results
 
 ## Prerequisites
 
@@ -70,7 +70,7 @@ claude mcp add --transport stdio codex-agent -- node ~/.claude/mcp-servers/codex
 // Synchronous (blocks until Codex responds)
 mcp__codex__codex({ prompt: "Explain this codebase" })
 
-// Asynchronous (returns immediately with a job ID)
+// Asynchronous (returns sessionId immediately)
 mcp__codex__codex({ prompt: "Explain this codebase", async: true })
 ```
 
@@ -105,46 +105,51 @@ mcp__codex__codex_review({ mode: "commit", commit: "e119e00", cwd: "/path/to/rep
 mcp__codex__codex_review({ mode: "custom", prompt: "Focus on security issues.", cwd: "/path/to/repo" })
 ```
 
-### `codex-result` — Poll for async job result
+### `codex-result` — Poll for latest turn result
 
 ```javascript
 // Immediate check
-mcp__codex__codex_result({ jobId: "job-1" })
+mcp__codex__codex_result({ sessionId: "019a..." })
 
 // Long-poll (blocks up to 30s for a state change)
-mcp__codex__codex_result({ jobId: "job-1", waitMs: 30000 })
+mcp__codex__codex_result({ sessionId: "019a...", waitMs: 30000 })
 ```
 
-Returns a job snapshot with `status`, `done`, `output`, `error`, `sessionId`, etc.
+Returns the latest turn's snapshot with `status`, `done`, `output`, `error`, etc.
 
-### `codex-cancel` — Cancel an async job
+### `codex-cancel` — Cancel the active turn
 
 ```javascript
-mcp__codex__codex_cancel({ jobId: "job-1" })
+mcp__codex__codex_cancel({ sessionId: "019a..." })
 ```
 
-If the job is still running, sends an interrupt. If already completed, returns the current state unchanged.
+If a turn is still in progress, sends an interrupt. If no active turn or already completed, returns the current state unchanged.
 
 ## Async Mode
 
 Use `async: true` when you have other work to do while Codex thinks — editing files, running tests, consulting other tools. If you would just poll in a loop, use sync (the default) instead.
 
 ```javascript
-// 1. Start the job
+// 1. Start async — returns sessionId immediately
 const resp = mcp__codex__codex({ prompt: "Complex analysis task", async: true })
-// Returns: { jobId: "job-1", status: "starting", sessionId: "...", done: false }
+// Returns: { sessionId: "019a...", status: "starting", done: false }
 
 // 2. Poll for the result (long-poll recommended)
-const result = mcp__codex__codex_result({ jobId: "job-1", waitMs: 30000 })
-// Returns: { jobId: "job-1", status: "succeeded", output: "...", done: true }
+const result = mcp__codex__codex_result({ sessionId: "019a...", waitMs: 30000 })
+// Returns: { sessionId: "019a...", status: "succeeded", output: "...", done: true }
 
-// 3. Cancel if needed
-mcp__codex__codex_cancel({ jobId: "job-1" })
+// 3. Continue the conversation (same sessionId)
+mcp__codex__codex_reply({ sessionId: "019a...", prompt: "follow-up" })
+
+// 4. Cancel if needed
+mcp__codex__codex_cancel({ sessionId: "019a..." })
 ```
 
-Job states: `starting` → `running` → `succeeded` | `failed` | `cancelled` | `timed_out`
+`sessionId` is the only identifier — it works for `codex-reply`, `codex-result`, and `codex-cancel`.
 
-Jobs are in-memory and connection-scoped — they persist for the lifetime of the MCP process but do not survive restarts.
+Turn states: `starting` → `running` → `succeeded` | `failed` | `cancelled` | `timed_out`
+
+Sessions are in-memory and connection-scoped — they persist for the lifetime of the MCP process but do not survive restarts.
 
 ## Configuration
 

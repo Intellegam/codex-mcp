@@ -44,8 +44,8 @@ node test/send.js codex "prompt"
 node test/send.js codex --async "prompt"
 
 # Test new tools
-node test/send.js codex-result <jobId>
-node test/send.js codex-cancel <jobId>
+node test/send.js codex-result <sessionId>
+node test/send.js codex-cancel <sessionId>
 ```
 
 ## Related
