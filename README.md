@@ -111,8 +111,8 @@ mcp__codex__codex_review({ mode: "custom", prompt: "Focus on security issues.", 
 // Immediate check
 mcp__codex__codex_result({ sessionId: "019a..." })
 
-// Long-poll (blocks up to 30s for a state change)
-mcp__codex__codex_result({ sessionId: "019a...", waitMs: 30000 })
+// Block until done
+mcp__codex__codex_result({ sessionId: "019a...", wait: true })
 ```
 
 Returns the latest turn's snapshot with `status`, `done`, `output`, `error`, etc.
@@ -134,8 +134,8 @@ Use `async: true` when you have other work to do while Codex thinks — editing 
 const resp = mcp__codex__codex({ prompt: "Complex analysis task", async: true })
 // Returns: { sessionId: "019a...", status: "starting", done: false }
 
-// 2. Poll for the result (long-poll recommended)
-const result = mcp__codex__codex_result({ sessionId: "019a...", waitMs: 30000 })
+// 2. Wait for the result
+const result = mcp__codex__codex_result({ sessionId: "019a...", wait: true })
 // Returns: { sessionId: "019a...", status: "succeeded", output: "...", done: true }
 
 // 3. Continue the conversation (same sessionId)

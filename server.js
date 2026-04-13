@@ -17,11 +17,10 @@ const crypto = require("crypto");
 const path = require("path");
 const readline = require("readline");
 
-const VERSION = "3.1.0";
+const VERSION = "3.2.0";
 const TIMEOUT_MS =
   parseInt(process.env.CODEX_TIMEOUT_MS, 10) || 30 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 5_000;
-const RESULT_WAIT_MAX_MS = 30_000;
 const CANCEL_WATCHDOG_MS = 30_000;
 
 // ---------------------------------------------------------------------------
@@ -616,28 +615,29 @@ function handleTurnNotification(turn, msg) {
 // --- Session waiter support (long-poll for codex-result) ---
 
 function notifySessionWaiters(session) {
-  for (const waiter of session.waiters) {
+  // Copy and clear before calling — waiters may re-add themselves
+  const waiters = [...session.waiters];
+  session.waiters.clear();
+  for (const waiter of waiters) {
     waiter();
   }
-  session.waiters.clear();
 }
 
-function waitForSessionChange(session, waitMs) {
+function waitForSessionDone(session) {
   return new Promise((resolve) => {
     const turn = turns.get(session.latestTurnId);
-    if (!turn || isTerminal(turn.status) || waitMs <= 0) {
+    if (!turn || isTerminal(turn.status)) {
       resolve();
       return;
     }
-    const cappedMs = Math.min(waitMs, RESULT_WAIT_MAX_MS);
-    const timer = setTimeout(() => {
-      session.waiters.delete(waiter);
-      resolve();
-    }, cappedMs);
-    if (timer.unref) timer.unref();
     const waiter = () => {
-      clearTimeout(timer);
-      resolve();
+      // Only resolve when the turn is terminal — ignore intermediate state changes
+      const t = turns.get(session.latestTurnId);
+      if (!t || isTerminal(t.status)) {
+        resolve();
+      } else {
+        session.waiters.add(waiter);
+      }
     };
     session.waiters.add(waiter);
   });
@@ -967,13 +967,12 @@ async function runCodexReview(args) {
 // Async tool implementations
 // ---------------------------------------------------------------------------
 
-async function runCodexResult({ sessionId, waitMs = 0 }) {
+async function runCodexResult({ sessionId, wait = false }) {
   const session = sessions.get(sessionId);
   if (!session) throw new Error("Unknown sessionId");
 
-  const turn = turns.get(session.latestTurnId);
-  if (turn && !isTerminal(turn.status) && waitMs > 0) {
-    await waitForSessionChange(session, waitMs);
+  if (wait) {
+    await waitForSessionDone(session);
   }
 
   return snapshotSession(session);
@@ -1146,20 +1145,18 @@ function handleToolsList(message) {
       {
         name: "codex-result",
         description:
-          "Get the latest turn status or result for a Codex session. Use `waitMs` for long-polling — blocks until the turn changes state or the wait expires. Works for any session started by codex, codex-reply, or codex-review.",
+          "Get the latest turn status or result for a Codex session. Works for any session started by codex, codex-reply, or codex-review.",
         inputSchema: {
           type: "object",
           properties: {
             sessionId: {
               type: "string",
-              description:
-                "Session ID to check",
+              description: "Session ID to check",
             },
-            waitMs: {
-              type: "integer",
-              minimum: 0,
-              maximum: RESULT_WAIT_MAX_MS,
-              description: `Optional long-poll timeout in milliseconds (max ${RESULT_WAIT_MAX_MS / 1000}s). If the latest turn is still active, waits up to this long for a state change before returning.`,
+            wait: {
+              type: "boolean",
+              description:
+                "If true, blocks until the latest turn completes. If false or omitted, returns the current state immediately.",
             },
           },
           required: ["sessionId"],

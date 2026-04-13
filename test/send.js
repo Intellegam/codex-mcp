@@ -12,7 +12,7 @@
  *   node test/send.js codex-review commit abc123
  *   node test/send.js codex-review custom "Focus on security"
  *   node test/send.js codex-result <sessionId>
- *   node test/send.js codex-result <sessionId> --wait 10000
+ *   node test/send.js codex-result <sessionId> --wait
  *   node test/send.js codex-cancel <sessionId>
  */
 
@@ -38,7 +38,7 @@ if (!tool || tool === "--help" || tool === "-h") {
   console.log("  node test/send.js codex-review commit <sha>");
   console.log('  node test/send.js codex-review custom "instructions"');
   console.log("  node test/send.js codex-result <sessionId>");
-  console.log("  node test/send.js codex-result <sessionId> --wait 10000");
+  console.log("  node test/send.js codex-result <sessionId> --wait");
   console.log("  node test/send.js codex-cancel <sessionId>");
   process.exit(0);
 }
@@ -70,8 +70,7 @@ function buildArgs() {
     }
     case "codex-result": {
       const args = { sessionId: rest[0] };
-      const waitIdx = rest.indexOf("--wait");
-      if (waitIdx !== -1) args.waitMs = parseInt(rest[waitIdx + 1], 10);
+      if (rest.includes("--wait")) args.wait = true;
       return args;
     }
     case "codex-cancel":
@@ -94,7 +93,7 @@ async function main() {
   const rl = readline.createInterface({ input: proc.stdout });
   let waiter = null;
 
-  function wait(ms = 600000) {
+  function wait(ms = 35 * 60 * 1000) { // 35 min — exceeds max turn timeout (30 min)
     return new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error("timeout")), ms);
       waiter = (msg) => {
@@ -152,33 +151,28 @@ async function main() {
     console.log(block.text);
   }
 
-  // For async calls, poll codex-result until the turn completes
+  // For async calls, wait for the turn to complete
   if (isAsync) {
     const snapshot = JSON.parse(resp.result.content[0].text);
     if (!snapshot.done) {
-      console.error(`\n→ Polling codex-result (sessionId: ${snapshot.sessionId})...\n`);
-      let result = snapshot;
-      while (!result.done) {
-        send({
-          jsonrpc: "2.0",
-          id: nextId++,
-          method: "tools/call",
-          params: {
-            name: "codex-result",
-            arguments: { sessionId: result.sessionId, waitMs: 30000 },
-          },
-        });
-        const pollResp = await wait(60000);
-        if (pollResp.error) {
-          console.error(`Poll error: ${pollResp.error.message}`);
-          done();
-          process.exit(1);
-        }
-        result = JSON.parse(pollResp.result.content[0].text);
-        console.error(
-          `  status: ${result.status}, elapsed: ${result.elapsed}`,
-        );
+      console.error(`\n→ Waiting for result (sessionId: ${snapshot.sessionId})...\n`);
+      send({
+        jsonrpc: "2.0",
+        id: nextId++,
+        method: "tools/call",
+        params: {
+          name: "codex-result",
+          arguments: { sessionId: snapshot.sessionId, wait: true },
+        },
+      });
+      const pollResp = await wait(); // server blocks until the turn completes
+      if (pollResp.error) {
+        console.error(`Error: ${pollResp.error.message}`);
+        done();
+        process.exit(1);
       }
+      const result = JSON.parse(pollResp.result.content[0].text);
+      console.error(`  status: ${result.status}, elapsed: ${result.elapsed}`);
       console.log(result.output);
       if (result.sessionId) {
         console.log(`\n[SESSION_ID: ${result.sessionId}]`);
