@@ -1,6 +1,6 @@
 # Codex MCP Server
 
-An MCP server that communicates with Codex via the [app-server](https://developers.openai.com/codex/app-server) JSON-RPC protocol, providing reliable session tracking for multi-turn conversations with timeout protection.
+An MCP server that communicates with Codex via the [app-server](https://developers.openai.com/codex/app-server) JSON-RPC protocol, providing reliable session tracking for multi-turn conversations with timeout protection and async job support.
 
 ## How It Works
 
@@ -9,7 +9,8 @@ An MCP server that communicates with Codex via the [app-server](https://develope
 3. Translates MCP tool calls to app-server RPC methods (`thread/start`, `turn/start`, `review/start`)
 4. Collects streaming notifications until `turn/completed`
 5. Returns response text and `[SESSION_ID: xxx]` (the Codex thread ID) to the client
-6. Enforces configurable timeouts (default 5 minutes) to prevent indefinite hangs
+6. Enforces configurable timeouts (default 30 minutes) to prevent indefinite hangs
+7. Supports async mode — return a job ID immediately and poll for results
 
 ## Prerequisites
 
@@ -61,16 +62,21 @@ claude mcp add --transport stdio codex-agent -- node ~/.claude/mcp-servers/codex
 
 **Note:** Tools will be namespaced under whatever server name you choose.
 
-## Usage
+## Tools
 
-Once configured, use the MCP tools as normal. The response will include the session ID:
+### `codex` — Start a new session
 
+```javascript
+// Synchronous (blocks until Codex responds)
+mcp__codex__codex({ prompt: "Explain this codebase" })
+
+// Asynchronous (returns immediately with a job ID)
+mcp__codex__codex({ prompt: "Explain this codebase", async: true })
 ```
-Response: "Here's the answer..."
-[SESSION_ID: 019a7661-3643-7ac3-aeb9-098a910935fb]
-```
 
-Extract the ID and use it for follow-ups:
+Optional parameters: `cwd`, `writable` (default false), `async` (default false).
+
+### `codex-reply` — Continue an existing session
 
 ```javascript
 mcp__codex__codex_reply({
@@ -79,17 +85,9 @@ mcp__codex__codex_reply({
 })
 ```
 
-Within the same MCP connection, follow-ups work immediately. Across MCP reconnections, pass `cwd` to help the app-server locate the persisted thread on disk:
+Within the same MCP connection, follow-ups work immediately. Across MCP reconnections, pass `cwd` to help the app-server locate the persisted thread on disk.
 
-```javascript
-mcp__codex__codex_reply({
-  sessionId: "019a7661-3643-7ac3-aeb9-098a910935fb",
-  prompt: "follow-up question",
-  cwd: "/path/to/original/repo"
-})
-```
-
-### Code reviews
+### `codex-review` — Code review
 
 Reviews are ephemeral — they do not return a session ID and cannot be resumed. Use `codex` instead of `codex-review` if follow-up discussion is needed.
 
@@ -107,11 +105,53 @@ mcp__codex__codex_review({ mode: "commit", commit: "e119e00", cwd: "/path/to/rep
 mcp__codex__codex_review({ mode: "custom", prompt: "Focus on security issues.", cwd: "/path/to/repo" })
 ```
 
+### `codex-result` — Poll for async job result
+
+```javascript
+// Immediate check
+mcp__codex__codex_result({ jobId: "job-1" })
+
+// Long-poll (blocks up to 30s for a state change)
+mcp__codex__codex_result({ jobId: "job-1", waitMs: 30000 })
+```
+
+Returns a job snapshot with `status`, `done`, `output`, `error`, `sessionId`, etc.
+
+### `codex-cancel` — Cancel an async job
+
+```javascript
+mcp__codex__codex_cancel({ jobId: "job-1" })
+```
+
+If the job is still running, sends an interrupt. If already completed, returns the current state unchanged.
+
+## Async Mode
+
+Use `async: true` when you have other work to do while Codex thinks — editing files, running tests, consulting other tools. If you would just poll in a loop, use sync (the default) instead.
+
+```javascript
+// 1. Start the job
+const resp = mcp__codex__codex({ prompt: "Complex analysis task", async: true })
+// Returns: { jobId: "job-1", status: "starting", sessionId: "...", done: false }
+
+// 2. Poll for the result (long-poll recommended)
+const result = mcp__codex__codex_result({ jobId: "job-1", waitMs: 30000 })
+// Returns: { jobId: "job-1", status: "succeeded", output: "...", done: true }
+
+// 3. Cancel if needed
+mcp__codex__codex_cancel({ jobId: "job-1" })
+```
+
+Job states: `starting` → `running` → `succeeded` | `failed` | `cancelled` | `timed_out`
+
+Jobs are in-memory and connection-scoped — they do not survive MCP process restarts. Completed jobs are retained for 1 hour (configurable via `CODEX_JOB_TTL_MS`).
+
 ## Configuration
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `CODEX_TIMEOUT_MS` | `1800000` (30 min) | Maximum time to wait for a Codex response before timing out |
+| `CODEX_TIMEOUT_MS` | `1800000` (30 min) | Maximum time to wait for a Codex turn to complete |
+| `CODEX_JOB_TTL_MS` | `3600000` (1 hr) | How long completed async job results are retained |
 
 ## Architecture
 
@@ -119,7 +159,8 @@ Uses the Codex app-server JSON-RPC protocol instead of CLI subprocess calls:
 
 - **Per-connection lifecycle**: One `codex app-server` process per MCP connection, isolated between concurrent Claude sessions
 - **Formal protocol**: Bidirectional JSON-RPC 2.0 with typed requests/responses and streaming notifications
-- **Timeout protection**: Configurable timeouts with `turn/interrupt` on expiry to prevent ghost turns
+- **Job engine**: Async-first design — sync tools are thin wrappers over the job engine. Jobs tracked in an in-memory Map with state machine, thread guards, and TTL eviction
+- **Timeout protection**: Configurable timeouts with `turn/interrupt` on expiry and a 30s cancel watchdog to prevent ghost turns
 - **Clean shutdown**: App server process is terminated on SIGINT, SIGTERM, or stdin close
-- **Session resume**: Non-ephemeral threads are persisted to `~/.codex/sessions/` by Codex after the first completed turn. `thread/resume` with `threadId` + `cwd` reloads them in a fresh app-server connection. Within the same connection, threads are already loaded and `turn/start` works directly (tracked via `loadedThreads` set)
-- **Parallel-safe notifications**: Each active turn registers a handler keyed by thread ID, so concurrent tool calls on different threads dispatch independently
+- **Session resume**: Non-ephemeral threads are persisted to `~/.codex/sessions/` by Codex after the first completed turn. `thread/resume` with `threadId` + `cwd` reloads them in a fresh app-server connection
+- **Thread safety**: One active job per thread enforced via thread guard. Concurrent async jobs on different threads dispatch independently

@@ -139,9 +139,19 @@ rl.on("line", (line) => {
       break;
     }
 
-    case "turn/interrupt":
+    case "turn/interrupt": {
       send({ id, result: {} });
+      // Simulate the turn completing after interrupt
+      const intThreadId = params.threadId;
+      const intTurnId = params.turnId;
+      setTimeout(() => {
+        send({
+          method: "turn/completed",
+          params: { threadId: intThreadId, turn: { id: intTurnId, status: "completed", items: [] } },
+        });
+      }, 10);
       break;
+    }
 
     default:
       send({ id, error: { code: -32601, message: `Unknown method: ${method}` } });
