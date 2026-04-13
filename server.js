@@ -13,6 +13,7 @@
  */
 
 const { spawn } = require("child_process");
+const crypto = require("crypto");
 const path = require("path");
 const readline = require("readline");
 
@@ -264,7 +265,7 @@ async function getAppServer(cwd) {
 
 const jobs = new Map();
 const activeJobsByThread = new Map();
-let nextJobId = 0;
+// No counter — UUIDs prevent confusion across MCP restarts
 let evictionTimer = null;
 
 const TERMINAL_STATES = new Set([
@@ -279,7 +280,7 @@ function isTerminal(status) {
 }
 
 function createJob({ toolName, cwd, timeoutMs }) {
-  const id = `job-${++nextJobId}`;
+  const id = `job-${crypto.randomUUID()}`;
   const now = Date.now();
   let resolveDone;
   const donePromise = new Promise((resolve) => {
