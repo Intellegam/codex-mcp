@@ -199,7 +199,7 @@ describe("codex-review tool", () => {
   let server;
   afterEach(() => server?.close());
 
-  test("returns review without session ID", async () => {
+  test("returns review with session ID", async () => {
     server = spawnServer();
     await server.mcpInit();
     server.send({
@@ -209,8 +209,8 @@ describe("codex-review tool", () => {
     const resp = await server.waitResponse();
     expect(resp.error).toBeUndefined();
     expect(resp.result.content[0].text).toContain("Mock review: code looks good.");
-    // No session ID for reviews
-    expect(resp.result.content.length).toBe(1);
+    // Reviews now return session IDs like other tools
+    expect(resp.result.content[1].text).toMatch(/SESSION_ID:/);
   });
 
   test("rejects missing mode", async () => {

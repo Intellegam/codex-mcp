@@ -89,7 +89,7 @@ Within the same MCP connection, follow-ups work immediately. Across MCP reconnec
 
 ### `codex-review` — Code review
 
-Reviews are ephemeral — they do not return a session ID and cannot be resumed. Use `codex` instead of `codex-review` if follow-up discussion is needed.
+Reviews return a session ID and can be continued with `codex-reply` for follow-up discussion (e.g., "explain finding #3 in more detail").
 
 ```javascript
 // Review uncommitted changes
@@ -144,14 +144,13 @@ mcp__codex__codex_cancel({ jobId: "job-1" })
 
 Job states: `starting` → `running` → `succeeded` | `failed` | `cancelled` | `timed_out`
 
-Jobs are in-memory and connection-scoped — they do not survive MCP process restarts. Completed jobs are retained for 1 hour (configurable via `CODEX_JOB_TTL_MS`).
+Jobs are in-memory and connection-scoped — they persist for the lifetime of the MCP process but do not survive restarts.
 
 ## Configuration
 
 | Environment Variable | Default | Description |
 |---|---|---|
 | `CODEX_TIMEOUT_MS` | `1800000` (30 min) | Maximum time to wait for a Codex turn to complete |
-| `CODEX_JOB_TTL_MS` | `3600000` (1 hr) | How long completed async job results are retained |
 
 ## Architecture
 

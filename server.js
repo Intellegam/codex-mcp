@@ -21,8 +21,6 @@ const VERSION = "3.0.0";
 const TIMEOUT_MS =
   parseInt(process.env.CODEX_TIMEOUT_MS, 10) || 30 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 5_000;
-const JOB_TTL_MS =
-  parseInt(process.env.CODEX_JOB_TTL_MS, 10) || 60 * 60 * 1000;
 const JOB_RESULT_WAIT_MAX_MS = 30_000;
 
 // ---------------------------------------------------------------------------
@@ -266,7 +264,6 @@ async function getAppServer(cwd) {
 const jobs = new Map();
 const activeJobsByThread = new Map();
 // No counter — UUIDs prevent confusion across MCP restarts
-let evictionTimer = null;
 
 const TERMINAL_STATES = new Set([
   "succeeded",
@@ -293,7 +290,6 @@ function createJob({ toolName, cwd, timeoutMs }) {
     createdAt: now,
     updatedAt: now,
     finishedAt: null,
-    expiresAt: null,
     cwd,
     timeoutMs,
     threadId: null,
@@ -329,7 +325,6 @@ function settleJob(job, status, patch = {}) {
     status,
     updatedAt: now,
     finishedAt: now,
-    expiresAt: now + JOB_TTL_MS,
     output:
       patch.output ?? (job.reviewText || job.lastMessage || job.output || ""),
   });
@@ -337,7 +332,6 @@ function settleJob(job, status, patch = {}) {
   releaseThreadClaim(job); // Safety net — cleanup usually handles this
   notifyJobWaiters(job);
   job.resolveDone(job);
-  scheduleEvictionSweep();
 }
 
 function failJob(job, err, source) {
@@ -356,7 +350,6 @@ function snapshotJob(job) {
     finishedAt: job.finishedAt
       ? new Date(job.finishedAt).toISOString()
       : null,
-    expiresAt: job.expiresAt ? new Date(job.expiresAt).toISOString() : null,
     elapsed: job.finishedAt
       ? `${Math.round((job.finishedAt - job.createdAt) / 1000)}s`
       : `${Math.round((Date.now() - job.createdAt) / 1000)}s (running)`,
@@ -583,34 +576,6 @@ function waitForJobChange(job, waitMs) {
   });
 }
 
-// --- Eviction ---
-
-function scheduleEvictionSweep() {
-  if (evictionTimer) clearTimeout(evictionTimer);
-  const now = Date.now();
-  let nextExpiresAt = Infinity;
-
-  for (const [id, job] of jobs) {
-    if (job.expiresAt && job.expiresAt <= now) {
-      jobs.delete(id);
-      continue;
-    }
-    if (job.expiresAt && job.expiresAt < nextExpiresAt) {
-      nextExpiresAt = job.expiresAt;
-    }
-  }
-
-  if (Number.isFinite(nextExpiresAt)) {
-    evictionTimer = setTimeout(
-      scheduleEvictionSweep,
-      Math.max(1000, nextExpiresAt - now),
-    );
-    if (evictionTimer.unref) evictionTimer.unref();
-  } else {
-    evictionTimer = null;
-  }
-}
-
 // --- App server exit hook ---
 
 function failJobsForServer(server, error) {
@@ -835,7 +800,7 @@ async function submitCodexReviewJob(args) {
     cwd,
     sandbox: "read-only",
     approvalPolicy: "never",
-    ephemeral: true,
+    ephemeral: false,
   };
 
   let thread;
@@ -866,7 +831,7 @@ async function submitCodexReviewJob(args) {
 
   server.loadedThreads.add(thread.id);
   job.threadId = thread.id;
-  // Reviews are ephemeral — no sessionId
+  job.sessionId = thread.id;
 
   try {
     claimThread(thread.id, job);
@@ -917,7 +882,7 @@ async function runCodexReview(args) {
   if (job.status !== "succeeded") {
     throw new Error(job.error?.message || `Codex ${job.status}`);
   }
-  return { output: job.output };
+  return { sessionId: job.sessionId, output: job.output };
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,7 +1018,7 @@ function handleToolsList(message) {
       {
         name: "codex-review",
         description:
-          "Run a Codex code review on file changes (diffs, commits, uncommitted work). Reviews code quality, bugs, and correctness — not plans or architecture. For plan/architecture review, use `codex` or `codex-reply` instead. Review sessions are ephemeral and cannot be resumed.",
+          "Run a Codex code review on file changes (diffs, commits, uncommitted work). Reviews code quality, bugs, and correctness — not plans or architecture. For plan/architecture review, use `codex` or `codex-reply` instead. Review sessions return a sessionId and can be continued with `codex-reply`.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1216,7 +1181,6 @@ function sendError(id, code, message) {
 // ---------------------------------------------------------------------------
 
 function shutdown() {
-  if (evictionTimer) clearTimeout(evictionTimer);
   if (appServer) appServer.close();
   process.exit();
 }
