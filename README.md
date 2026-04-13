@@ -111,7 +111,7 @@ mcp__codex__codex_review({ mode: "custom", prompt: "Focus on security issues.", 
 
 | Environment Variable | Default | Description |
 |---|---|---|
-| `CODEX_TIMEOUT_MS` | `300000` (5 min) | Maximum time to wait for a Codex response before timing out |
+| `CODEX_TIMEOUT_MS` | `1800000` (30 min) | Maximum time to wait for a Codex response before timing out |
 
 ## Architecture
 

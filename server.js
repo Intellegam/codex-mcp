@@ -12,9 +12,9 @@ const { spawn } = require("child_process");
 const path = require("path");
 const readline = require("readline");
 
-const VERSION = "2.1.0";
+const VERSION = "2.1.1";
 const TIMEOUT_MS =
-  parseInt(process.env.CODEX_TIMEOUT_MS, 10) || 5 * 60 * 1000;
+  parseInt(process.env.CODEX_TIMEOUT_MS, 10) || 30 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 5_000; // 5s for individual RPC requests (thread/start, etc.) — these are control-plane ops that return in milliseconds
 
 // ---------------------------------------------------------------------------
