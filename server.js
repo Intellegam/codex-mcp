@@ -1067,7 +1067,7 @@ function handleToolsList(message) {
             async: {
               type: "boolean",
               description:
-                "Run asynchronously. Returns a sessionId immediately instead of blocking. Use `codex-result` to poll the latest turn state and `codex-cancel` to cancel. Use when you have other work to do in parallel — if you would just poll in a loop, use sync (the default) instead.",
+                "Run asynchronously. Returns a sessionId immediately instead of blocking. Use `codex-result` to poll the latest turn state and `codex-cancel` to cancel. Multiple async sessions can run at the same time. Use when you have other work to do in parallel — if you would just poll in a loop, use sync (the default) instead.",
             },
           },
           required: ["prompt"],

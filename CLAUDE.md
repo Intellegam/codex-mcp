@@ -14,13 +14,13 @@ You MUST read the following file for more information:
 
 ## Architecture
 
-Single-file server (`server.js`) with an async-first job engine:
+Single-file server (`server.js`) with an async-first turn engine:
 
 1. Receives MCP JSON-RPC messages on stdin
 2. Spawns a single `codex app-server` process per MCP connection
 3. Translates tool calls to app-server RPC methods (`thread/start`, `turn/start`, `review/start`)
-4. Tracks jobs in an in-memory Map with state machine (`starting` → `running` → terminal)
-5. Sync tools are thin wrappers that `await job.donePromise`
+4. Tracks turns in an in-memory Map with state machine (`starting` → `running` → terminal)
+5. Sync tools are thin wrappers that `await turn.donePromise`
 6. Returns results via MCP protocol with thread IDs as session IDs
 
 ## Tools Provided
@@ -28,8 +28,8 @@ Single-file server (`server.js`) with an async-first job engine:
 - `codex` - Start a new Codex session (supports `async: true` for non-blocking calls)
 - `codex-reply` - Continue an existing session using sessionId (supports `async: true`)
 - `codex-review` - Run code reviews (supports `async: true`)
-- `codex-result` - Poll for async job status/result (supports `waitMs` for long-polling)
-- `codex-cancel` - Cancel a running async job
+- `codex-result` - Get session status/result (supports `wait: true` to block until done)
+- `codex-cancel` - Cancel the active turn on a session
 
 ## Development
 
