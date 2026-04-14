@@ -17,7 +17,7 @@ const crypto = require("crypto");
 const path = require("path");
 const readline = require("readline");
 
-const VERSION = "3.2.2";
+const VERSION = "3.2.3";
 const TIMEOUT_MS =
   parseInt(process.env.CODEX_TIMEOUT_MS, 10) || 30 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 5_000;
