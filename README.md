@@ -22,10 +22,10 @@ An MCP server that communicates with Codex via the [app-server](https://develope
 
 ### Quick install (recommended)
 
-Run the server directly from GitHub via `bunx`:
+Run the server directly from GitHub via `npx`:
 
 ```bash
-claude mcp add codex-agent -- bunx github:hburrichter/codex-mcp
+claude mcp add codex-agent -- npx -y github:hburrichter/codex-mcp
 ```
 
 Verify it's connected:
@@ -43,8 +43,8 @@ Add this to a project to auto-load the server for that repo:
   "mcpServers": {
     "codex-agent": {
       "type": "stdio",
-      "command": "bunx",
-      "args": ["github:hburrichter/codex-mcp"],
+      "command": "npx",
+      "args": ["-y", "github:hburrichter/codex-mcp"],
       "env": {}
     }
   }
