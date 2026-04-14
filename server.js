@@ -17,7 +17,7 @@ const crypto = require("crypto");
 const path = require("path");
 const readline = require("readline");
 
-const VERSION = "3.2.3";
+const VERSION = "3.2.4";
 const TIMEOUT_MS =
   parseInt(process.env.CODEX_TIMEOUT_MS, 10) || 30 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -1024,7 +1024,10 @@ mcpRl.on("line", async (line) => {
         break;
 
       default:
-        sendError(message.id, -32601, "Method not found");
+        if (message.id !== undefined) {
+          sendError(message.id, -32601, "Method not found");
+        }
+        // Silently ignore unknown notifications (no id)
     }
   } catch (e) {
     console.error("Error processing message:", e);

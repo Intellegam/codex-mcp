@@ -1,6 +1,6 @@
 {
   "name": "codex-wrapper-mcp",
-  "version": "3.2.3",
+  "version": "3.2.4",
   "description": "MCP server for Codex using the app-server protocol with timeout protection and session tracking",
   "main": "server.js",
   "bin": {
