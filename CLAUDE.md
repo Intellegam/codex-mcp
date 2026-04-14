@@ -48,6 +48,18 @@ node test/send.js codex-result <sessionId>
 node test/send.js codex-cancel <sessionId>
 ```
 
+## Releasing
+
+When bumping the version, update all of these:
+
+1. `package.json` — `version` field
+2. `server.js` — `VERSION` constant
+3. Create a git tag: `git tag v{version} && git push origin v{version}`
+4. In `claude-plugins/plugins/codex/.mcp.json` — update `#v{version}` tag pin
+5. In `claude-plugins/` — bump version in both `plugin.json` and `marketplace.json`
+
+The `.mcp.json` uses `bunx github:Intellegam/codex-mcp#v{version}` with a pinned tag. Bunx aggressively caches bare `github:` refs, so the tag pin is required.
+
 ## Related
 
 - Used by: `claude-plugins/plugins/codex/` (references via `github:Intellegam/codex-mcp`)
