@@ -17,7 +17,7 @@ const crypto = require("crypto");
 const path = require("path");
 const readline = require("readline");
 
-const VERSION = "3.2.4";
+const VERSION = "3.2.6";
 const TIMEOUT_MS =
   parseInt(process.env.CODEX_TIMEOUT_MS, 10) || 30 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 5_000;
@@ -1045,7 +1045,7 @@ function handleInitialize(message) {
       version: VERSION,
     },
     instructions:
-      "IMPORTANT: Read the `collaborating-with-codex` skill before using any Codex tools. Codex is an external AI agent for second opinions on complex decisions. Form your own analysis first to avoid anchoring bias, then use Codex for brainstorming, plan validation, or code review. The `codex` tool defaults to read-only sandbox; set writable: true to allow file writes and command execution.",
+      "Read the `collaborating-with-codex` skill before using these tools. Codex is an external AI agent for second opinions, planning, and code review — form your own analysis first to avoid anchoring bias. `codex` defaults to read-only; `writable: true` allows file writes and commands and must be explicitly scoped in the prompt. `async: true` on `codex`, `codex-reply`, and `codex-review` returns a sessionId immediately instead of blocking; poll with `codex-result` (use `wait: true` to block until done) and stop with `codex-cancel`. Session IDs work across `codex-reply`, `codex-result`, and `codex-cancel`.",
   });
 }
 
@@ -1054,8 +1054,7 @@ function handleToolsList(message) {
     tools: [
       {
         name: "codex",
-        description:
-          "Start a new Codex session. Use like a sub-agent: be specific in prompts, provide context. Sessions can be resumed with `codex-reply` to continue the conversation.",
+        description: "Start a new Codex session.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1064,12 +1063,11 @@ function handleToolsList(message) {
             writable: {
               type: "boolean",
               description:
-                "Allow Codex to write files and run commands within the workspace. Defaults to false (read-only). CAUTION: When enabled, you MUST explicitly scope what Codex is and is not allowed to do in the prompt (e.g., 'run tests but do not modify any code', 'implement only in src/utils.js'). Never grant write access without clear boundaries in the prompt.",
+                "Allow file writes and commands. Default false; in the prompt, be explicit about what Codex should and should not do.",
             },
             async: {
               type: "boolean",
-              description:
-                "Run asynchronously. Returns a sessionId immediately instead of blocking. Use `codex-result` to poll the latest turn state and `codex-cancel` to cancel. Multiple async sessions can run at the same time. Use when you have other work to do in parallel — if you would just poll in a loop, use sync (the default) instead.",
+              description: "Run asynchronously.",
             },
           },
           required: ["prompt"],
@@ -1077,26 +1075,20 @@ function handleToolsList(message) {
       },
       {
         name: "codex-reply",
-        description:
-          "Continue an existing Codex session. Use for multi-turn discussions where prior context matters (e.g., follow-up questions, asking for review after brainstorming).",
+        description: "Continue an existing Codex session.",
         inputSchema: {
           type: "object",
           properties: {
-            sessionId: {
-              type: "string",
-              description:
-                "Session ID from a previous codex, codex-reply, or codex-review call",
-            },
+            sessionId: { type: "string", description: "Codex session ID" },
             prompt: { type: "string", description: "Follow-up prompt" },
             cwd: {
               type: "string",
               description:
-                "Working directory. Required when resuming a session from a previous MCP connection — should match the cwd used when the session was created.",
+                "Working directory. Required when resuming across MCP reconnections — must match the cwd used when the session was created.",
             },
             async: {
               type: "boolean",
-              description:
-                "Run asynchronously. Returns the same sessionId immediately. Use `codex-result` to poll the latest turn state and `codex-cancel` to cancel.",
+              description: "Run asynchronously.",
             },
           },
           required: ["sessionId", "prompt"],
@@ -1105,7 +1097,7 @@ function handleToolsList(message) {
       {
         name: "codex-review",
         description:
-          "Run a Codex code review on file changes (diffs, commits, uncommitted work). Reviews code quality, bugs, and correctness — not plans or architecture. For plan/architecture review, use `codex` or `codex-reply` instead. Review sessions return a sessionId and can be continued with `codex-reply`.",
+          "Code review on file changes. For plan/architecture review, use `codex` instead.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1113,32 +1105,28 @@ function handleToolsList(message) {
               type: "string",
               enum: ["uncommitted", "base", "commit", "custom"],
               description:
-                "REQUIRED. One of: `uncommitted` (review staged/unstaged/untracked changes), `base` (PR-style diff — also set `base`), `commit` (single commit — also set `commit`), `custom` (free-form — also set `prompt`).",
+                "`uncommitted` (staged/unstaged/untracked changes), `base` (PR-style diff against a branch), `commit` (single commit), `custom` (free-form instructions).",
             },
             base: {
               type: "string",
               description:
-                'Branch name to diff against. Required when mode=`base`. Example: "main".',
+                "Branch name to diff against. Required for mode=`base`.",
             },
             commit: {
               type: "string",
-              description:
-                "Commit SHA to review. Required when mode=`commit`.",
+              description: "Commit SHA. Required for mode=`commit`.",
             },
             prompt: {
               type: "string",
-              description:
-                "Review instructions. Required when mode=`custom`.",
+              description: "Review instructions. Required for mode=`custom`.",
             },
             cwd: {
               type: "string",
-              description:
-                "Working directory (repo root). If omitted, uses the server process CWD.",
+              description: "Repo root. Defaults to server CWD.",
             },
             async: {
               type: "boolean",
-              description:
-                "Run asynchronously. Returns a new sessionId immediately. Use `codex-result` to poll the review turn and `codex-cancel` to cancel.",
+              description: "Run asynchronously.",
             },
           },
           required: ["mode"],
@@ -1147,18 +1135,15 @@ function handleToolsList(message) {
       {
         name: "codex-result",
         description:
-          "Get the latest turn status or result for a Codex session. Works for any session started by codex, codex-reply, or codex-review.",
+          "Get the latest turn status or result for a Codex session.",
         inputSchema: {
           type: "object",
           properties: {
-            sessionId: {
-              type: "string",
-              description: "Session ID to check",
-            },
+            sessionId: { type: "string", description: "Session ID" },
             wait: {
               type: "boolean",
               description:
-                "If true, blocks until the latest turn completes. If false or omitted, returns the current state immediately.",
+                "Block until the latest turn completes. Default false (returns current state immediately).",
             },
           },
           required: ["sessionId"],
@@ -1167,14 +1152,11 @@ function handleToolsList(message) {
       {
         name: "codex-cancel",
         description:
-          "Cancel the active turn on a Codex session. If a turn is still in progress, requests cancellation. If no active turn or already completed, returns the current state unchanged.",
+          "Cancel the active turn on a Codex session. Safe to call regardless of turn state.",
         inputSchema: {
           type: "object",
           properties: {
-            sessionId: {
-              type: "string",
-              description: "Session ID whose active turn should be cancelled",
-            },
+            sessionId: { type: "string", description: "Session ID" },
           },
           required: ["sessionId"],
         },
