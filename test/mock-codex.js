@@ -6,6 +6,7 @@
  */
 
 const readline = require("readline");
+const fs = require("fs");
 
 if (process.argv[2] !== "app-server") {
   console.error("mock-codex: only app-server subcommand is supported");
@@ -14,13 +15,46 @@ if (process.argv[2] !== "app-server") {
 
 const rl = readline.createInterface({ input: process.stdin });
 
-// Track state for resume testing
+const stateFile = process.env.MOCK_STATE_FILE;
+const eventLog = process.env.MOCK_EVENT_LOG;
+const failArchive = process.env.MOCK_ARCHIVE_FAIL === "1";
+const archiveDelay =
+  parseInt(process.env.MOCK_ARCHIVE_DELAY_MS, 10) || 0;
+
+// Track persistent state across mock app-server processes when requested.
 const threads = new Map();
+if (stateFile && fs.existsSync(stateFile)) {
+  try {
+    const stored = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    for (const [threadId, state] of Object.entries(stored)) {
+      threads.set(threadId, state);
+    }
+  } catch {
+    // Tests should surface malformed state through subsequent protocol failures.
+  }
+}
 let crashAfterTurnStart = process.env.MOCK_CRASH_AFTER_TURN_START === "1";
 let turnDelay = parseInt(process.env.MOCK_TURN_DELAY_MS, 10) || 0;
 
 function send(msg) {
   process.stdout.write(JSON.stringify(msg) + "\n");
+}
+
+function record(method, params) {
+  if (!eventLog) return;
+  fs.appendFileSync(
+    eventLog,
+    JSON.stringify({ method, params, at: Date.now() }) + "\n",
+  );
+}
+
+function saveThreads() {
+  if (!stateFile) return;
+  const persistentThreads = {};
+  for (const [threadId, state] of threads) {
+    if (!state.ephemeral) persistentThreads[threadId] = state;
+  }
+  fs.writeFileSync(stateFile, JSON.stringify(persistentThreads));
 }
 
 rl.on("line", (line) => {
@@ -35,6 +69,7 @@ rl.on("line", (line) => {
   if (msg.id === undefined) return;
 
   const { id, method, params } = msg;
+  record(method, params);
 
   switch (method) {
     case "initialize":
@@ -47,7 +82,9 @@ rl.on("line", (line) => {
         cwd: params.cwd,
         sandbox: params.sandbox,
         ephemeral: params.ephemeral,
+        archived: false,
       });
+      saveThreads();
       send({
         id,
         result: {
@@ -70,10 +107,64 @@ rl.on("line", (line) => {
 
     case "thread/resume": {
       const threadId = params.threadId;
-      if (threads.has(threadId)) {
+      const thread = threads.get(threadId);
+      if (thread?.archived) {
+        send({
+          id,
+          error: {
+            code: -32600,
+            message: `session ${threadId} is archived. Run codex unarchive ${threadId} first`,
+          },
+        });
+      } else if (thread) {
         send({ id, result: { thread: { id: threadId, turns: [], status: "loaded" } } });
       } else {
         send({ id, error: { code: -32600, message: `no rollout found for thread id ${threadId}` } });
+      }
+      break;
+    }
+
+    case "thread/archive": {
+      const threadId = params.threadId;
+      const thread = threads.get(threadId);
+      setTimeout(() => {
+        if (failArchive) {
+          send({
+            id,
+            error: { code: -32603, message: "mock archive failure" },
+          });
+        } else if (!thread) {
+          send({
+            id,
+            error: {
+              code: -32600,
+              message: `no rollout found for thread id ${threadId}`,
+            },
+          });
+        } else {
+          thread.archived = true;
+          saveThreads();
+          send({ id, result: {} });
+        }
+      }, archiveDelay);
+      break;
+    }
+
+    case "thread/unarchive": {
+      const threadId = params.threadId;
+      const thread = threads.get(threadId);
+      if (!thread) {
+        send({
+          id,
+          error: {
+            code: -32600,
+            message: `no rollout found for thread id ${threadId}`,
+          },
+        });
+      } else {
+        thread.archived = false;
+        saveThreads();
+        send({ id, result: { thread: { id: threadId } } });
       }
       break;
     }
