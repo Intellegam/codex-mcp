@@ -366,7 +366,7 @@ function failTurn(turn, err, source) {
 
 // --- Session record ---
 
-function getOrCreateSession(sessionId, cwd) {
+function getOrCreateSession(sessionId, cwd, persistent) {
   let session = sessions.get(sessionId);
   if (!session) {
     const now = Date.now();
@@ -379,16 +379,25 @@ function getOrCreateSession(sessionId, cwd) {
       latestTurnId: null,
       activeTurnId: null,
       waiters: new Set(),
+      persistent: persistent !== false,
+      archived: false,
+      archiveAttemptedTurnId: null,
+      archivePromise: null,
+      archiveError: null,
     };
     sessions.set(sessionId, session);
   }
   if (cwd) session.cwd = cwd;
+  if (persistent !== undefined) session.persistent = persistent;
   return session;
 }
 
 function attachTurnToSession(session, turn) {
   session.latestTurnId = turn.id;
   session.activeTurnId = turn.id;
+  session.archived = false;
+  session.archiveAttemptedTurnId = null;
+  session.archiveError = null;
   session.updatedAt = Date.now();
   notifySessionWaiters(session);
 }
@@ -403,7 +412,7 @@ function snapshotSession(session) {
       error: { message: "No turn found for session", source: "internal" },
     };
   }
-  return {
+  const snapshot = {
     sessionId: session.sessionId,
     toolName: turn.toolName,
     status: turn.status,
@@ -419,6 +428,8 @@ function snapshotSession(session) {
     output: turn.output || "",
     error: turn.error,
   };
+  if (session.archiveError) snapshot.archiveError = session.archiveError;
+  return snapshot;
 }
 
 // --- Thread guard ---
@@ -670,6 +681,77 @@ function retryableServerClose(server) {
   return true;
 }
 
+function isArchivedThreadError(err) {
+  return /\bis archived\b|unarchive.+first/i.test(err?.message || "");
+}
+
+async function resumeThread(server, sessionId, cwd) {
+  const params = {
+    threadId: sessionId,
+    cwd,
+    approvalPolicy: "never",
+  };
+  try {
+    return await server.request("thread/resume", params);
+  } catch (err) {
+    if (!isArchivedThreadError(err)) throw err;
+    await server.request("thread/unarchive", { threadId: sessionId });
+    return server.request("thread/resume", params);
+  }
+}
+
+function archiveSessionAfterDelivery(session, deliveredTurnId) {
+  if (!session?.persistent) return Promise.resolve();
+  if (session.archiveAttemptedTurnId === deliveredTurnId) {
+    return session.archivePromise || Promise.resolve();
+  }
+
+  const turn = turns.get(deliveredTurnId);
+  if (
+    !turn ||
+    !isTerminal(turn.status) ||
+    session.latestTurnId !== deliveredTurnId ||
+    session.activeTurnId !== null
+  ) {
+    return Promise.resolve();
+  }
+
+  session.archiveAttemptedTurnId = deliveredTurnId;
+  const server = turn.server;
+  const archivePromise = (async () => {
+    try {
+      if (!server || server.closed) {
+        throw new Error("App server connection closed before archival");
+      }
+      await server.request("thread/archive", {
+        threadId: session.threadId,
+      });
+      session.archived = true;
+      session.archiveError = null;
+      server.loadedThreads.delete(session.threadId);
+    } catch (err) {
+      session.archived = false;
+      session.archiveError = {
+        message: err?.message || String(err),
+        source: "archive",
+      };
+      console.error(
+        `[codex-mcp] Failed to archive session ${session.sessionId}: ${session.archiveError.message}`,
+      );
+    } finally {
+      session.updatedAt = Date.now();
+    }
+  })();
+
+  const trackedPromise = archivePromise.finally(() => {
+    if (session.archivePromise === trackedPromise) {
+      session.archivePromise = null;
+    }
+  });
+  session.archivePromise = trackedPromise;
+  return session.archivePromise;
+}
+
 // ---------------------------------------------------------------------------
 // Turn submissions
 // ---------------------------------------------------------------------------
@@ -724,7 +806,7 @@ async function submitCodexStart(args) {
   turn.sessionId = thread.id;
 
   // Create session and attach turn synchronously before any async work
-  const session = getOrCreateSession(thread.id, cwd);
+  const session = getOrCreateSession(thread.id, cwd, true);
   attachTurnToSession(session, turn);
 
   try {
@@ -756,6 +838,11 @@ async function submitCodexResume(args) {
   turn.threadId = sessionId;
   turn.sessionId = sessionId;
 
+  const existingSession = sessions.get(sessionId);
+  if (existingSession?.archivePromise) {
+    await existingSession.archivePromise;
+  }
+
   let server;
   try {
     server = await getAppServer(cwd);
@@ -767,11 +854,7 @@ async function submitCodexResume(args) {
   if (!server.loadedThreads.has(sessionId)) {
     server.setupCount++;
     try {
-      await server.request("thread/resume", {
-        threadId: sessionId,
-        cwd,
-        approvalPolicy: "never",
-      });
+      await resumeThread(server, sessionId, cwd);
     } catch (err) {
       server.setupCount--;
       if (!retryableServerClose(server)) {
@@ -785,11 +868,7 @@ async function submitCodexResume(args) {
       }
       server.setupCount++;
       try {
-        await server.request("thread/resume", {
-          threadId: sessionId,
-          cwd,
-          approvalPolicy: "never",
-        });
+        await resumeThread(server, sessionId, cwd);
       } catch (retryErr) {
         server.setupCount--;
         failTurn(turn, retryErr, "setup");
@@ -811,7 +890,11 @@ async function submitCodexResume(args) {
   // Creating earlier would leave a stale session record on failed resume.
   // Attaching earlier would overwrite the session's latestTurnId, making
   // the real running turn unobservable if this setup fails.
-  const session = getOrCreateSession(sessionId, cwd);
+  const session = getOrCreateSession(
+    sessionId,
+    cwd,
+    existingSession?.persistent,
+  );
   attachTurnToSession(session, turn);
 
   runTurnCapture(turn, server, sessionId, () =>
@@ -877,7 +960,7 @@ async function submitCodexReview(args) {
     cwd,
     sandbox: "read-only",
     approvalPolicy: "never",
-    ephemeral: false,
+    ephemeral: true,
   };
 
   let thread;
@@ -911,7 +994,7 @@ async function submitCodexReview(args) {
   turn.sessionId = thread.id;
 
   // Create session and attach turn synchronously
-  const session = getOrCreateSession(thread.id, cwd);
+  const session = getOrCreateSession(thread.id, cwd, false);
   attachTurnToSession(session, turn);
 
   try {
@@ -940,27 +1023,33 @@ async function runCodexStart(args) {
   const turn = await submitCodexStart(args);
   if (!isTerminal(turn.status)) await turn.donePromise;
   if (turn.status !== "succeeded") {
-    throw new Error(turn.error?.message || `Codex ${turn.status}`);
+    const err = new Error(turn.error?.message || `Codex ${turn.status}`);
+    err.turn = turn;
+    throw err;
   }
-  return { sessionId: turn.sessionId, output: turn.output };
+  return { sessionId: turn.sessionId, output: turn.output, turn };
 }
 
 async function runCodexResume(args) {
   const turn = await submitCodexResume(args);
   if (!isTerminal(turn.status)) await turn.donePromise;
   if (turn.status !== "succeeded") {
-    throw new Error(turn.error?.message || `Codex ${turn.status}`);
+    const err = new Error(turn.error?.message || `Codex ${turn.status}`);
+    err.turn = turn;
+    throw err;
   }
-  return { sessionId: turn.sessionId, output: turn.output };
+  return { sessionId: turn.sessionId, output: turn.output, turn };
 }
 
 async function runCodexReview(args) {
   const turn = await submitCodexReview(args);
   if (!isTerminal(turn.status)) await turn.donePromise;
   if (turn.status !== "succeeded") {
-    throw new Error(turn.error?.message || `Codex ${turn.status}`);
+    const err = new Error(turn.error?.message || `Codex ${turn.status}`);
+    err.turn = turn;
+    throw err;
   }
-  return { sessionId: turn.sessionId, output: turn.output };
+  return { sessionId: turn.sessionId, output: turn.output, turn };
 }
 
 // ---------------------------------------------------------------------------
@@ -975,7 +1064,11 @@ async function runCodexResult({ sessionId, wait = false }) {
     await waitForSessionDone(session);
   }
 
-  return snapshotSession(session);
+  return {
+    snapshot: snapshotSession(session),
+    session,
+    turnId: session.latestTurnId,
+  };
 }
 
 function runCodexCancel({ sessionId }) {
@@ -1097,7 +1190,7 @@ function handleToolsList(message) {
       {
         name: "codex-review",
         description:
-          "Code review on file changes. For plan/architecture review, use `codex` instead.",
+          "Code review on file changes. Review threads are ephemeral: same-connection follow-up works, but restart recovery is not available. For plan/architecture review, use `codex` instead.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1203,16 +1296,19 @@ async function handleToolCall(message) {
 
     // --- Session tools ---
     if (name === "codex-result") {
-      const snapshot = await runCodexResult(args);
-      sendResponse(message.id, {
+      const { snapshot, session, turnId } = await runCodexResult(args);
+      await sendResponse(message.id, {
         content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
       });
+      if (snapshot.done) {
+        await archiveSessionAfterDelivery(session, turnId);
+      }
       return;
     }
 
     if (name === "codex-cancel") {
       const snapshot = runCodexCancel(args);
-      sendResponse(message.id, {
+      await sendResponse(message.id, {
         content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
       });
       return;
@@ -1239,9 +1335,15 @@ async function handleToolCall(message) {
       });
     }
 
-    sendResponse(message.id, { content });
+    await sendResponse(message.id, { content });
+    const session = sessions.get(result.sessionId);
+    await archiveSessionAfterDelivery(session, result.turn.id);
   } catch (e) {
-    sendError(message.id, -32603, e.message);
+    await sendError(message.id, -32603, e.message);
+    if (e.turn?.sessionId) {
+      const session = sessions.get(e.turn.sessionId);
+      await archiveSessionAfterDelivery(session, e.turn.id);
+    }
   }
 }
 
@@ -1270,24 +1372,52 @@ function snapshotFallback(turn) {
 // ---------------------------------------------------------------------------
 
 function sendResponse(id, result) {
-  console.log(JSON.stringify({ jsonrpc: "2.0", id, result }));
+  return writeMcpMessage({ jsonrpc: "2.0", id, result });
 }
 
 function sendError(id, code, message) {
-  console.log(
-    JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }),
-  );
+  return writeMcpMessage({
+    jsonrpc: "2.0",
+    id,
+    error: { code, message },
+  });
+}
+
+function writeMcpMessage(message) {
+  return new Promise((resolve) => {
+    process.stdout.write(JSON.stringify(message) + "\n", resolve);
+  });
 }
 
 // ---------------------------------------------------------------------------
 // Clean shutdown
 // ---------------------------------------------------------------------------
 
-function shutdown() {
+let shuttingDown = false;
+
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  // Let a just-flushed terminal response enter its post-delivery archive step,
+  // then give only those already-started archive operations time to settle.
+  await new Promise((resolve) => setImmediate(resolve));
+  const pendingArchives = [...sessions.values()]
+    .map((session) => session.archivePromise)
+    .filter(Boolean);
+  if (pendingArchives.length > 0) {
+    await Promise.race([
+      Promise.allSettled(pendingArchives),
+      new Promise((resolve) =>
+        setTimeout(resolve, REQUEST_TIMEOUT_MS + 250),
+      ),
+    ]);
+  }
+
   if (appServer) appServer.close();
   process.exit();
 }
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
-process.stdin.on("end", shutdown);
+process.on("SIGINT", () => void shutdown());
+process.on("SIGTERM", () => void shutdown());
+process.stdin.on("end", () => void shutdown());

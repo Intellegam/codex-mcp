@@ -86,7 +86,11 @@ Within the same MCP connection, follow-ups work immediately. Across MCP reconnec
 
 ### `codex-review` — Code review
 
-Reviews return a session ID and can be continued with `codex-reply` for follow-up discussion (e.g., "explain finding #3 in more detail").
+Reviews return a session ID and can be continued with `codex-reply` for
+follow-up discussion while the same app-server connection is alive (e.g.,
+"explain finding #3 in more detail"). Review threads are ephemeral, so they do
+not appear in persistent Codex history and cannot be resumed after an app-server
+restart.
 
 ```
 // Review uncommitted changes
@@ -146,7 +150,23 @@ codex-cancel({ sessionId: "019a..." })
 
 Turn states: `starting` → `running` → `succeeded` | `failed` | `cancelled` | `timed_out`
 
-Sessions are in-memory and connection-scoped — they persist for the lifetime of the MCP process but do not survive restarts.
+Polling state is in-memory and connection-scoped. Non-review Codex threads are
+persistent and can be resumed by `codex-reply` after an MCP restart using their
+session ID (and matching `cwd`). Review threads are ephemeral and only support
+follow-up while their original app-server connection is alive.
+
+### Thread history lifecycle
+
+- `codex-review` creates an ephemeral Codex thread.
+- `codex` creates a persistent thread. Persistent threads are archived after a
+  synchronous terminal response has been written to the MCP caller.
+- In async mode, persistent threads remain unarchived until `codex-result`
+  delivers a terminal snapshot. A `codex-cancel` response alone does not
+  archive the thread.
+- A later `codex-reply` automatically unarchives and resumes a persistent
+  thread, then archives it again after delivering the follow-up result.
+- Archival is best-effort. Failure never replaces the task result; it is logged
+  on stderr and exposed as `archiveError` on later result snapshots.
 
 ### Parallel Sessions
 
@@ -181,6 +201,13 @@ Uses the Codex app-server JSON-RPC protocol instead of CLI subprocess calls:
 - **Formal protocol**: Bidirectional JSON-RPC 2.0 with typed requests/responses and streaming notifications
 - **Async-first engine**: Turns tracked in an in-memory Map with state machine and thread guards. Sync tools are thin wrappers that await completion
 - **Timeout protection**: Configurable timeouts with `turn/interrupt` on expiry and a 30s cancel watchdog to prevent ghost turns
-- **Clean shutdown**: App server process is terminated on SIGINT, SIGTERM, or stdin close
-- **Session resume**: Non-ephemeral threads are persisted to `~/.codex/sessions/` by Codex after the first completed turn. `thread/resume` with `threadId` + `cwd` reloads them in a fresh app-server connection
+- **Clean shutdown**: On SIGINT, SIGTERM, or stdin close, already-started
+  post-delivery archival gets a bounded chance to settle before the app server
+  is terminated
+- **Session resume**: Non-ephemeral threads are persisted by Codex. Archived
+  threads are automatically unarchived, then reloaded with `thread/resume`
+  using `threadId` + `cwd` in a fresh app-server connection
+- **History cleanup**: Persistent threads are archived only after terminal
+  result delivery; review threads are ephemeral and never enter persistent
+  history
 - **Thread safety**: One active turn per session enforced via thread guard. Concurrent async sessions on different threads dispatch independently

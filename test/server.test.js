@@ -1,28 +1,38 @@
 import { describe, test, expect, beforeAll, afterAll, afterEach } from "bun:test";
 import { spawn } from "child_process";
 import { createInterface } from "readline";
+import fs from "fs";
+import crypto from "crypto";
+import os from "os";
 import path from "path";
 
 const SERVER_JS = path.join(import.meta.dir, "..", "server.js");
 const MOCK_CODEX = path.join(import.meta.dir, "mock-codex.js");
 const SERVER_CWD = path.join(import.meta.dir, "..");
 
-// Make the mock codex binary findable as "codex" in PATH
-const MOCK_BIN_DIR = path.join(import.meta.dir, "mock-bin");
+// Make the mock codex binary findable as "codex" in PATH.
+// Keep generated test state outside the checkout.
+let mockTestDir;
+let mockBinDir;
+let mockArtifactDir;
 
 beforeAll(async () => {
-  const fs = await import("fs");
-  fs.mkdirSync(MOCK_BIN_DIR, { recursive: true });
+  mockTestDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-mcp-test-"));
+  mockBinDir = path.join(mockTestDir, "bin");
+  mockArtifactDir = path.join(mockTestDir, "artifacts");
+  fs.mkdirSync(mockBinDir, { recursive: true });
+  fs.mkdirSync(mockArtifactDir, { recursive: true });
   fs.writeFileSync(
-    path.join(MOCK_BIN_DIR, "codex"),
+    path.join(mockBinDir, "codex"),
     `#!/bin/sh\nexec node "${MOCK_CODEX}" "$@"\n`,
   );
-  fs.chmodSync(path.join(MOCK_BIN_DIR, "codex"), 0o755);
+  fs.chmodSync(path.join(mockBinDir, "codex"), 0o755);
 });
 
 afterAll(async () => {
-  const fs = await import("fs");
-  fs.rmSync(MOCK_BIN_DIR, { recursive: true, force: true });
+  if (mockTestDir) {
+    fs.rmSync(mockTestDir, { recursive: true, force: true });
+  }
 });
 
 /**
@@ -30,12 +40,21 @@ afterAll(async () => {
  * Returns helpers to send MCP messages and read responses.
  */
 function spawnServer(envOverrides = {}) {
+  const instanceId = crypto.randomUUID();
+  const eventLog =
+    envOverrides.MOCK_EVENT_LOG ||
+    path.join(mockArtifactDir, `${instanceId}.events.jsonl`);
+  const stateFile =
+    envOverrides.MOCK_STATE_FILE ||
+    path.join(mockArtifactDir, `${instanceId}.state.json`);
   const proc = spawn("bun", [SERVER_JS], {
     cwd: SERVER_CWD,
     env: {
       ...process.env,
-      PATH: `${MOCK_BIN_DIR}:${process.env.PATH}`,
+      PATH: `${mockBinDir}:${process.env.PATH}`,
       CODEX_TIMEOUT_MS: "3000", // short timeout for tests
+      MOCK_EVENT_LOG: eventLog,
+      MOCK_STATE_FILE: stateFile,
       ...envOverrides,
     },
     stdio: ["pipe", "pipe", "pipe"],
@@ -90,7 +109,61 @@ function spawnServer(envOverrides = {}) {
     proc.kill("SIGTERM");
   }
 
-  return { proc, send, waitResponse, mcpInit, close, getStderr: () => stderr };
+  function endInputAndWait(timeoutMs = 3000) {
+    proc.stdin.end();
+    if (proc.exitCode !== null) return Promise.resolve(proc.exitCode);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("server exit timeout")),
+        timeoutMs,
+      );
+      proc.once("exit", (code) => {
+        clearTimeout(timer);
+        resolve(code);
+      });
+    });
+  }
+
+  function getMockEvents() {
+    if (!fs.existsSync(eventLog)) return [];
+    return fs
+      .readFileSync(eventLog, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  }
+
+  return {
+    proc,
+    send,
+    waitResponse,
+    mcpInit,
+    close,
+    endInputAndWait,
+    getStderr: () => stderr,
+    getMockEvents,
+    eventLog,
+    stateFile,
+  };
+}
+
+async function waitForCondition(check, message, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = check();
+    if (value) return value;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(message);
+}
+
+async function waitForMockMethod(server, method, timeoutMs = 3000) {
+  return waitForCondition(
+    () => server.getMockEvents().find((event) => event.method === method),
+    `Mock never received ${method}`,
+    timeoutMs,
+  );
 }
 
 // -------------------------------------------------------------------------
@@ -102,8 +175,8 @@ describe("MCP protocol", () => {
   test("initialize returns server info", async () => {
     server = spawnServer();
     const resp = await server.mcpInit();
-    expect(resp.result.serverInfo.name).toBe("codex-cli-wrapper");
-    expect(resp.result.serverInfo.version).toBe("3.2.0");
+    expect(resp.result.serverInfo.name).toBe("codex-mcp");
+    expect(resp.result.serverInfo.version).toBe("3.2.6");
     expect(resp.result.protocolVersion).toBe("2024-11-05");
   });
 
@@ -152,6 +225,32 @@ describe("codex tool", () => {
     const texts = resp.result.content.map((c) => c.text);
     expect(texts[0]).toContain("Mock response to: hello");
     expect(texts[1]).toMatch(/\[SESSION_ID: thr_/);
+
+    const start = server
+      .getMockEvents()
+      .find((event) => event.method === "thread/start");
+    expect(start.params.ephemeral).toBe(false);
+    const archive = await waitForMockMethod(server, "thread/archive");
+    expect(archive.params.threadId).toBe(
+      texts[1].match(/SESSION_ID: ([^\]]+)/)[1],
+    );
+  });
+
+  test("graceful MCP shutdown waits for post-delivery archival", async () => {
+    server = spawnServer({ MOCK_ARCHIVE_DELAY_MS: "100" });
+    await server.mcpInit();
+    server.send({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "codex", arguments: { prompt: "then disconnect" } },
+    });
+    const response = await server.waitResponse();
+    const sessionId = response.result.content[1].text.match(/SESSION_ID: ([^\]]+)/)[1];
+
+    const exitCode = await server.endInputAndWait();
+    expect(exitCode).toBe(0);
+    const persisted = JSON.parse(fs.readFileSync(server.stateFile, "utf8"));
+    expect(persisted[sessionId].archived).toBe(true);
+    server = null;
   });
 });
 
@@ -180,6 +279,86 @@ describe("codex-reply tool", () => {
     expect(replyResp.error).toBeUndefined();
     expect(replyResp.result.content[0].text).toContain("Mock response to: follow-up");
     expect(replyResp.result.content[1].text).toContain(sessionId);
+
+    await waitForCondition(
+      () =>
+        server
+          .getMockEvents()
+          .filter((event) => event.method === "thread/archive").length === 2,
+      "Both persistent turns were not archived",
+    );
+    const methods = server.getMockEvents().map((event) => event.method);
+    expect(methods).toContain("thread/unarchive");
+    expect(methods.filter((method) => method === "thread/archive").length).toBe(
+      2,
+    );
+  });
+
+  test("resumes an archived persistent session after MCP reconnection", async () => {
+    const sharedState = path.join(
+      mockArtifactDir,
+      `${crypto.randomUUID()}.shared-state.json`,
+    );
+    const sharedEvents = path.join(
+      mockArtifactDir,
+      `${crypto.randomUUID()}.shared-events.jsonl`,
+    );
+
+    const firstServer = spawnServer({
+      MOCK_STATE_FILE: sharedState,
+      MOCK_EVENT_LOG: sharedEvents,
+    });
+    await firstServer.mcpInit();
+    firstServer.send({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "codex", arguments: { prompt: "first" } },
+    });
+    const startResp = await firstServer.waitResponse();
+    const sessionId = startResp.result.content[1].text.match(/SESSION_ID: ([^\]]+)/)[1];
+    await waitForMockMethod(firstServer, "thread/archive");
+    await waitForCondition(
+      () => {
+        if (!fs.existsSync(sharedState)) return false;
+        return JSON.parse(fs.readFileSync(sharedState, "utf8"))[sessionId]
+          ?.archived;
+      },
+      "Persistent thread was not archived in shared mock state",
+    );
+    firstServer.close();
+
+    server = spawnServer({
+      MOCK_STATE_FILE: sharedState,
+      MOCK_EVENT_LOG: sharedEvents,
+    });
+    await server.mcpInit();
+    server.send({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "codex-reply", arguments: { sessionId, prompt: "after reconnect" } },
+    });
+    const replyResp = await server.waitResponse();
+    expect(replyResp.error).toBeUndefined();
+    expect(replyResp.result.content[0].text).toContain("after reconnect");
+
+    await waitForCondition(
+      () =>
+        server
+          .getMockEvents()
+          .filter((event) => event.method === "thread/archive").length === 2,
+      "Follow-up turn was not re-archived",
+    );
+    const lifecycle = server
+      .getMockEvents()
+      .map((event) => event.method)
+      .filter((method) =>
+        ["thread/resume", "thread/unarchive", "thread/archive"].includes(method),
+      );
+    expect(lifecycle).toEqual([
+      "thread/archive",
+      "thread/resume",
+      "thread/unarchive",
+      "thread/resume",
+      "thread/archive",
+    ]);
   });
 
   test("resume fails for unknown session", async () => {
@@ -210,6 +389,40 @@ describe("codex-review tool", () => {
     expect(resp.error).toBeUndefined();
     expect(resp.result.content[0].text).toContain("Mock review: code looks good.");
     expect(resp.result.content[1].text).toMatch(/SESSION_ID:/);
+
+    const start = server
+      .getMockEvents()
+      .find((event) => event.method === "thread/start");
+    expect(start.params.ephemeral).toBe(true);
+    expect(
+      server
+        .getMockEvents()
+        .some((event) => event.method === "thread/archive"),
+    ).toBe(false);
+  });
+
+  test("ephemeral review supports same-connection follow-up without archival", async () => {
+    server = spawnServer();
+    await server.mcpInit();
+    server.send({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "codex-review", arguments: { mode: "uncommitted" } },
+    });
+    const reviewResp = await server.waitResponse();
+    const sessionId = reviewResp.result.content[1].text.match(/SESSION_ID: ([^\]]+)/)[1];
+
+    server.send({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "codex-reply", arguments: { sessionId, prompt: "clarify" } },
+    });
+    const replyResp = await server.waitResponse();
+    expect(replyResp.error).toBeUndefined();
+    expect(replyResp.result.content[0].text).toContain("clarify");
+    expect(
+      server
+        .getMockEvents()
+        .some((event) => event.method === "thread/archive"),
+    ).toBe(false);
   });
 
   test("rejects missing mode", async () => {
@@ -271,6 +484,7 @@ describe("timeout and error handling", () => {
     const resp = await server.waitResponse(5000);
     expect(resp.error).toBeDefined();
     expect(resp.error.message).toContain("timed out");
+    await waitForMockMethod(server, "thread/archive");
   });
 
   test("app-server crash rejects immediately", async () => {
@@ -340,6 +554,82 @@ describe("async codex", () => {
     expect(final.sessionId).toBe(snap.sessionId);
     expect(final.output).toContain("Mock response to: async hello");
     expect(final.error).toBeNull();
+    await waitForMockMethod(server, "thread/archive");
+  });
+
+  test("does not archive a terminal async turn until codex-result delivers it", async () => {
+    server = spawnServer({ MOCK_TURN_DELAY_MS: "25" });
+    await server.mcpInit();
+
+    const response = await asyncCall(server, 1, "codex", {
+      prompt: "deferred delivery",
+      async: true,
+    });
+    const started = parseSnapshot(response);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(
+      server
+        .getMockEvents()
+        .some((event) => event.method === "thread/archive"),
+    ).toBe(false);
+
+    const resultResponse = await asyncCall(server, 2, "codex-result", {
+      sessionId: started.sessionId,
+    });
+    const terminal = parseSnapshot(resultResponse);
+    expect(terminal.done).toBe(true);
+    expect(terminal.status).toBe("succeeded");
+    await waitForMockMethod(server, "thread/archive");
+  });
+
+  test("nonterminal codex-result polling does not archive", async () => {
+    server = spawnServer({ MOCK_TURN_DELAY_MS: "200" });
+    await server.mcpInit();
+
+    const response = await asyncCall(server, 1, "codex", {
+      prompt: "still running",
+      async: true,
+    });
+    const started = parseSnapshot(response);
+    const pollResponse = await asyncCall(server, 2, "codex-result", {
+      sessionId: started.sessionId,
+    });
+    const running = parseSnapshot(pollResponse);
+    expect(running.done).toBe(false);
+    expect(
+      server
+        .getMockEvents()
+        .some((event) => event.method === "thread/archive"),
+    ).toBe(false);
+
+    const terminal = await waitUntilDone(server, started.sessionId, 3);
+    expect(terminal.done).toBe(true);
+    await waitForMockMethod(server, "thread/archive");
+  });
+
+  test("terminal result delivery archives only once", async () => {
+    server = spawnServer();
+    await server.mcpInit();
+
+    const response = await asyncCall(server, 1, "codex", {
+      prompt: "one archive",
+      async: true,
+    });
+    const started = parseSnapshot(response);
+    await waitUntilDone(server, started.sessionId, 2);
+    await waitForMockMethod(server, "thread/archive");
+
+    const secondResult = await asyncCall(server, 3, "codex-result", {
+      sessionId: started.sessionId,
+    });
+    expect(parseSnapshot(secondResult).done).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(
+      server
+        .getMockEvents()
+        .filter((event) => event.method === "thread/archive").length,
+    ).toBe(1);
   });
 
   test("codex-result wait: true blocks until done", async () => {
@@ -391,12 +681,18 @@ describe("async codex", () => {
     const cancelResp = await asyncCall(server, 200, "codex-cancel", { sessionId: snap.sessionId });
     const cancelSnap = parseSnapshot(cancelResp);
     expect(cancelSnap.cancelRequested).toBe(true);
+    expect(
+      server
+        .getMockEvents()
+        .some((event) => event.method === "thread/archive"),
+    ).toBe(false);
 
     const final = await waitUntilDone(server, snap.sessionId, 300);
     expect(final.status).toBe("cancelled");
     expect(final.done).toBe(true);
     expect(final.cancelRequested).toBe(true);
     expect(final.error).toBeNull();
+    await waitForMockMethod(server, "thread/archive");
   });
 
   test("cancel after done is a no-op", async () => {
@@ -453,6 +749,40 @@ describe("async codex", () => {
     expect(final.done).toBe(true);
     expect(final.cancelRequested).toBe(true);
     expect(final.error.source).toMatch(/timeout|cancel/);
+    await waitForMockMethod(server, "thread/archive");
+  });
+});
+
+describe("archive failure handling", () => {
+  let server;
+  afterEach(() => server?.close());
+
+  test("does not replace a delivered task result and exposes the later failure", async () => {
+    server = spawnServer({ MOCK_ARCHIVE_FAIL: "1" });
+    await server.mcpInit();
+    server.send({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "codex", arguments: { prompt: "keep my result" } },
+    });
+    const response = await server.waitResponse();
+    expect(response.error).toBeUndefined();
+    expect(response.result.content[0].text).toContain("keep my result");
+    const sessionId = response.result.content[1].text.match(/SESSION_ID: ([^\]]+)/)[1];
+
+    await waitForCondition(
+      () => server.getStderr().includes("mock archive failure"),
+      "Archive failure was not logged",
+    );
+    const resultResponse = await asyncCall(server, 2, "codex-result", {
+      sessionId,
+    });
+    const snapshot = parseSnapshot(resultResponse);
+    expect(snapshot.status).toBe("succeeded");
+    expect(snapshot.output).toContain("keep my result");
+    expect(snapshot.archiveError).toEqual({
+      message: "mock archive failure",
+      source: "archive",
+    });
   });
 });
 
