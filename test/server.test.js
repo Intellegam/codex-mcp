@@ -176,7 +176,7 @@ describe("MCP protocol", () => {
     server = spawnServer();
     const resp = await server.mcpInit();
     expect(resp.result.serverInfo.name).toBe("codex-mcp");
-    expect(resp.result.serverInfo.version).toBe("3.2.6");
+    expect(resp.result.serverInfo.version).toBe("3.2.7");
     expect(resp.result.protocolVersion).toBe("2024-11-05");
   });
 
