@@ -176,7 +176,7 @@ describe("MCP protocol", () => {
     server = spawnServer();
     const resp = await server.mcpInit();
     expect(resp.result.serverInfo.name).toBe("codex-mcp");
-    expect(resp.result.serverInfo.version).toBe("3.2.7");
+    expect(resp.result.serverInfo.version).toBe("3.2.8");
     expect(resp.result.protocolVersion).toBe("2024-11-05");
   });
 
@@ -292,6 +292,108 @@ describe("codex-reply tool", () => {
     expect(methods.filter((method) => method === "thread/archive").length).toBe(
       2,
     );
+  });
+
+  test("recovers when archived state is enforced at turn start", async () => {
+    server = spawnServer({ MOCK_ARCHIVE_ENFORCE: "turn" });
+    await server.mcpInit();
+
+    server.send({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "codex", arguments: { prompt: "first" } },
+    });
+    const startResp = await server.waitResponse();
+    const sessionId = startResp.result.content[1].text.match(/SESSION_ID: ([^\]]+)/)[1];
+
+    server.send({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "codex-reply", arguments: { sessionId, prompt: "follow-up" } },
+    });
+    const replyResp = await server.waitResponse();
+    expect(replyResp.error).toBeUndefined();
+    expect(replyResp.result.content[0].text).toContain("Mock response to: follow-up");
+
+    const methods = server.getMockEvents().map((event) => event.method);
+    expect(methods).toContain("thread/unarchive");
+    expect(methods.filter((method) => method === "turn/start").length).toBe(3);
+  });
+
+  test("claims a session before concurrent reply setup", async () => {
+    server = spawnServer({
+      MOCK_ARCHIVE_ENFORCE: "turn",
+      MOCK_RESUME_DELAY_MS: "100",
+    });
+    await server.mcpInit();
+    server.send({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "codex", arguments: { prompt: "first" } },
+    });
+    const startResp = await server.waitResponse();
+    const sessionId = startResp.result.content[1].text.match(/SESSION_ID: ([^\]]+)/)[1];
+    await waitForCondition(
+      () =>
+        server
+          .getMockEvents()
+          .some((event) => event.method === "mock/archive-applied"),
+      "Initial archive was not applied",
+    );
+
+    server.send({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "codex-reply", arguments: { sessionId, prompt: "first reply" } },
+    });
+    server.send({
+      jsonrpc: "2.0", id: 3, method: "tools/call",
+      params: { name: "codex-reply", arguments: { sessionId, prompt: "second reply" } },
+    });
+    const responses = [await server.waitResponse(), await server.waitResponse()];
+    expect(responses.filter((response) => response.error).length).toBe(1);
+    expect(responses.filter((response) => !response.error).length).toBe(1);
+    const failedResponse = responses.find((response) => response.error);
+    expect(failedResponse.id).toBe(3);
+    expect(failedResponse.error.message).toContain("already has an active turn");
+
+    const resumeCount = server
+      .getMockEvents()
+      .filter((event) => event.method === "thread/resume").length;
+    expect(resumeCount).toBe(1);
+  });
+
+  test("re-archives when resume fails after unarchive", async () => {
+    server = spawnServer({ MOCK_RESUME_FAIL_AFTER_UNARCHIVE: "1" });
+    await server.mcpInit();
+    server.send({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "codex", arguments: { prompt: "first" } },
+    });
+    const startResp = await server.waitResponse();
+    const sessionId = startResp.result.content[1].text.match(/SESSION_ID: ([^\]]+)/)[1];
+    await waitForCondition(
+      () =>
+        server
+          .getMockEvents()
+          .filter((event) => event.method === "mock/archive-applied").length === 1,
+      "Initial archive was not applied",
+    );
+
+    server.send({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "codex-reply", arguments: { sessionId, prompt: "follow-up" } },
+    });
+    const replyResp = await server.waitResponse();
+    expect(replyResp.error?.message).toContain("no rollout found");
+    await waitForCondition(
+      () =>
+        server
+          .getMockEvents()
+          .filter((event) => event.method === "mock/archive-applied").length === 2,
+      "Unarchived thread was not archived again",
+    );
+
+    const methods = server.getMockEvents().map((event) => event.method);
+    expect(methods.filter((method) => method === "thread/resume").length).toBe(3);
+    expect(methods.filter((method) => method === "thread/unarchive").length).toBe(1);
+    expect(methods.filter((method) => method === "thread/archive").length).toBe(2);
   });
 
   test("resumes an archived persistent session after MCP reconnection", async () => {
@@ -423,6 +525,32 @@ describe("codex-review tool", () => {
         .getMockEvents()
         .some((event) => event.method === "thread/archive"),
     ).toBe(false);
+  });
+
+  test("failed ephemeral resume preserves the previous delivered review", async () => {
+    server = spawnServer({ MOCK_EXIT_AFTER_REVIEW_COMPLETE: "1" });
+    await server.mcpInit();
+    server.send({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "codex-review", arguments: { mode: "uncommitted" } },
+    });
+    const reviewResp = await server.waitResponse();
+    const sessionId = reviewResp.result.content[1].text.match(/SESSION_ID: ([^\]]+)/)[1];
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    server.send({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "codex-reply", arguments: { sessionId, prompt: "follow-up" } },
+    });
+    const replyResp = await server.waitResponse();
+    expect(replyResp.error?.message).toContain("no rollout found");
+
+    const resultResponse = await asyncCall(server, 3, "codex-result", {
+      sessionId,
+    });
+    const snapshot = parseSnapshot(resultResponse);
+    expect(snapshot.status).toBe("succeeded");
+    expect(snapshot.output).toContain("Mock review: code looks good.");
   });
 
   test("rejects missing mode", async () => {
@@ -581,6 +709,46 @@ describe("async codex", () => {
     expect(terminal.done).toBe(true);
     expect(terminal.status).toBe("succeeded");
     await waitForMockMethod(server, "thread/archive");
+  });
+
+  test("failed reply does not archive an undelivered async result", async () => {
+    server = spawnServer({
+      MOCK_EXIT_AFTER_TURN_COMPLETE: "1",
+      MOCK_RESUME_FAIL: "1",
+    });
+    await server.mcpInit();
+
+    const response = await asyncCall(server, 1, "codex", {
+      prompt: "undelivered result",
+      async: true,
+    });
+    const started = parseSnapshot(response);
+    await waitForCondition(
+      () =>
+        server
+          .getMockEvents()
+          .some((event) => event.method === "mock/exiting-after-turn"),
+      "Async turn did not complete before the app-server exit",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const replyResponse = await asyncCall(server, 2, "codex-reply", {
+      sessionId: started.sessionId,
+      prompt: "follow-up",
+      async: true,
+    });
+    const failedReply = parseSnapshot(replyResponse);
+    expect(failedReply.status).toBe("failed");
+    expect(failedReply.error?.message).toContain("no rollout found");
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const resultResponse = await asyncCall(server, 3, "codex-result", {
+      sessionId: started.sessionId,
+    });
+    const originalResult = parseSnapshot(resultResponse);
+    expect(originalResult.status).toBe("succeeded");
+    expect(originalResult.output).toContain("Mock response to: undelivered result");
+    expect(originalResult.archiveError).toBeUndefined();
   });
 
   test("nonterminal codex-result polling does not archive", async () => {
@@ -783,6 +951,78 @@ describe("archive failure handling", () => {
       message: "mock archive failure",
       source: "archive",
     });
+
+    server.send({
+      jsonrpc: "2.0", id: 3, method: "tools/call",
+      params: { name: "codex-reply", arguments: { sessionId, prompt: "follow-up" } },
+    });
+    const replyResponse = await server.waitResponse();
+    expect(replyResponse.error).toBeUndefined();
+    expect(replyResponse.result.content[0].text).toContain("Mock response to: follow-up");
+    expect(
+      server
+        .getMockEvents()
+        .filter((event) => event.method === "thread/resume").length,
+    ).toBe(0);
+  });
+
+  test("reconnects after an archive applies before disconnect", async () => {
+    server = spawnServer({ MOCK_ARCHIVE_FAIL_AFTER_APPLY: "1" });
+    await server.mcpInit();
+    server.send({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "codex", arguments: { prompt: "first" } },
+    });
+    const response = await server.waitResponse();
+    const sessionId = response.result.content[1].text.match(/SESSION_ID: ([^\]]+)/)[1];
+
+    await waitForCondition(
+      () => server.getStderr().includes("codex app-server exited"),
+      "Ambiguous archive failure was not logged",
+    );
+    server.send({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "codex-reply", arguments: { sessionId, prompt: "follow-up" } },
+    });
+    const replyResp = await server.waitResponse();
+    expect(replyResp.error).toBeUndefined();
+    expect(replyResp.result.content[0].text).toContain("Mock response to: follow-up");
+
+    const methods = server.getMockEvents().map((event) => event.method);
+    expect(methods).toContain("thread/resume");
+    expect(methods).toContain("thread/unarchive");
+  });
+
+  test("invalidates loaded state after a live archive timeout", async () => {
+    server = spawnServer({
+      CODEX_REQUEST_TIMEOUT_MS: "100",
+      MOCK_ARCHIVE_TIMEOUT_AFTER_APPLY: "1",
+      MOCK_ARCHIVE_ENFORCE: "both",
+    });
+    await server.mcpInit();
+    server.send({
+      jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "codex", arguments: { prompt: "first" } },
+    });
+    const response = await server.waitResponse();
+    const sessionId = response.result.content[1].text.match(/SESSION_ID: ([^\]]+)/)[1];
+
+    await waitForCondition(
+      () => server.getStderr().includes("thread/archive timed out"),
+      "Live archive timeout was not logged",
+    );
+    server.send({
+      jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "codex-reply", arguments: { sessionId, prompt: "follow-up" } },
+    });
+    const replyResp = await server.waitResponse();
+    expect(replyResp.error).toBeUndefined();
+    expect(replyResp.result.content[0].text).toContain("Mock response to: follow-up");
+
+    const methods = server.getMockEvents().map((event) => event.method);
+    expect(methods).toContain("thread/resume");
+    expect(methods).toContain("thread/unarchive");
+    expect(server.getStderr()).not.toContain("codex app-server exited");
   });
 });
 

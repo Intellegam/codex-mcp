@@ -164,9 +164,13 @@ follow-up while their original app-server connection is alive.
   delivers a terminal snapshot. A `codex-cancel` response alone does not
   archive the thread.
 - A later `codex-reply` automatically unarchives and resumes a persistent
-  thread, then archives it again after delivering the follow-up result.
+  thread. Archived state is recovered whether Codex reports it while reloading
+  the thread or while starting the follow-up turn. The thread is archived again
+  after delivering the result.
 - Archival is best-effort. Failure never replaces the task result; it is logged
-  on stderr and exposed as `archiveError` on later result snapshots.
+  on stderr and exposed as `archiveError` on later result snapshots. Ambiguous
+  archive failures invalidate cached load state so the next reply reconciles
+  against Codex instead of trusting stale in-memory state.
 
 ### Parallel Sessions
 
@@ -189,9 +193,10 @@ This works for any combination of `codex`, `codex-reply`, and `codex-review` —
 
 ## Configuration
 
-| Environment Variable | Default            | Description                                       |
-| -------------------- | ------------------ | ------------------------------------------------- |
-| `CODEX_TIMEOUT_MS`   | `1800000` (30 min) | Maximum time to wait for a Codex turn to complete |
+| Environment Variable        | Default            | Description                                             |
+| --------------------------- | ------------------ | ------------------------------------------------------- |
+| `CODEX_TIMEOUT_MS`          | `1800000` (30 min) | Maximum time to wait for a Codex turn to complete       |
+| `CODEX_REQUEST_TIMEOUT_MS`  | `5000` (5 sec)     | Maximum time to wait for an app-server request response |
 
 ## Architecture
 
@@ -205,8 +210,9 @@ Uses the Codex app-server JSON-RPC protocol instead of CLI subprocess calls:
   post-delivery archival gets a bounded chance to settle before the app server
   is terminated
 - **Session resume**: Non-ephemeral threads are persisted by Codex. Archived
-  threads are automatically unarchived, then reloaded with `thread/resume`
-  using `threadId` + `cwd` in a fresh app-server connection
+  threads are automatically unarchived when either `thread/resume` or
+  `turn/start` reports archived state, using `threadId` + `cwd` when a fresh
+  app-server connection must reload the thread
 - **History cleanup**: Persistent threads are archived only after terminal
   result delivery; review threads are ephemeral and never enter persistent
   history
