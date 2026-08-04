@@ -17,10 +17,11 @@ const crypto = require("crypto");
 const path = require("path");
 const readline = require("readline");
 
-const VERSION = "3.2.7";
+const VERSION = "3.2.8";
 const TIMEOUT_MS =
   parseInt(process.env.CODEX_TIMEOUT_MS, 10) || 30 * 60 * 1000;
-const REQUEST_TIMEOUT_MS = 5_000;
+const REQUEST_TIMEOUT_MS =
+  parseInt(process.env.CODEX_REQUEST_TIMEOUT_MS, 10) || 5_000;
 const CANCEL_WATCHDOG_MS = 30_000;
 
 // ---------------------------------------------------------------------------
@@ -310,11 +311,14 @@ function createTurn({ toolName, cwd, timeoutMs }) {
     lastMessage: "",
     reviewText: "",
     error: null,
+    resultDelivered: false,
     cancelRequested: false,
     cancelReason: null,
     interruptPending: false,
     interruptSent: false,
     server: null,
+    archiveAfterDeliveryTurnId: null,
+    archiveAfterDeliveryServer: null,
     donePromise,
     resolveDone,
     cleanup: null,
@@ -696,11 +700,20 @@ async function resumeThread(server, sessionId, cwd) {
   } catch (err) {
     if (!isArchivedThreadError(err)) throw err;
     await server.request("thread/unarchive", { threadId: sessionId });
-    return server.request("thread/resume", params);
+    try {
+      return await server.request("thread/resume", params);
+    } catch (retryErr) {
+      retryErr.threadUnarchived = true;
+      throw retryErr;
+    }
   }
 }
 
-function archiveSessionAfterDelivery(session, deliveredTurnId) {
+function archiveSessionAfterDelivery(
+  session,
+  deliveredTurnId,
+  serverOverride = null,
+) {
   if (!session?.persistent) return Promise.resolve();
   if (session.archiveAttemptedTurnId === deliveredTurnId) {
     return session.archivePromise || Promise.resolve();
@@ -710,6 +723,7 @@ function archiveSessionAfterDelivery(session, deliveredTurnId) {
   if (
     !turn ||
     !isTerminal(turn.status) ||
+    !turn.resultDelivered ||
     session.latestTurnId !== deliveredTurnId ||
     session.activeTurnId !== null
   ) {
@@ -717,19 +731,30 @@ function archiveSessionAfterDelivery(session, deliveredTurnId) {
   }
 
   session.archiveAttemptedTurnId = deliveredTurnId;
-  const server = turn.server;
+  const server = serverOverride || turn.server;
   const archivePromise = (async () => {
+    let wasLoaded = false;
     try {
       if (!server || server.closed) {
         throw new Error("App server connection closed before archival");
       }
+      // An archive request may succeed server-side even if its response is
+      // lost or times out. Stop treating this connection's cached thread as
+      // usable before sending the request so the next reply reconciles via
+      // thread/resume instead of dispatching against ambiguous archived state.
+      wasLoaded = server.loadedThreads.delete(session.threadId);
       await server.request("thread/archive", {
         threadId: session.threadId,
       });
       session.archived = true;
       session.archiveError = null;
-      server.loadedThreads.delete(session.threadId);
     } catch (err) {
+      // A JSON-RPC error response is a definite archive rejection; the thread
+      // is still loaded on this live connection. Timeouts and disconnects are
+      // ambiguous, so leave the cache invalidated and reconcile on reply.
+      if (err?.data && server && !server.closed && wasLoaded) {
+        server.loadedThreads.add(session.threadId);
+      }
       session.archived = false;
       session.archiveError = {
         message: err?.message || String(err),
@@ -839,46 +864,9 @@ async function submitCodexResume(args) {
   turn.sessionId = sessionId;
 
   const existingSession = sessions.get(sessionId);
-  if (existingSession?.archivePromise) {
-    await existingSession.archivePromise;
-  }
 
-  let server;
-  try {
-    server = await getAppServer(cwd);
-  } catch (err) {
-    failTurn(turn, err, "setup");
-    return turn;
-  }
-
-  if (!server.loadedThreads.has(sessionId)) {
-    server.setupCount++;
-    try {
-      await resumeThread(server, sessionId, cwd);
-    } catch (err) {
-      server.setupCount--;
-      if (!retryableServerClose(server)) {
-        failTurn(turn, err, "setup");
-        return turn;
-      }
-      server = await getAppServer(cwd).catch(() => null);
-      if (!server) {
-        failTurn(turn, err, "setup");
-        return turn;
-      }
-      server.setupCount++;
-      try {
-        await resumeThread(server, sessionId, cwd);
-      } catch (retryErr) {
-        server.setupCount--;
-        failTurn(turn, retryErr, "setup");
-        return turn;
-      }
-    }
-    server.setupCount--;
-    server.loadedThreads.add(sessionId);
-  }
-
+  // Claim before any awaited setup so a concurrent reply cannot race through
+  // resume while the previously delivered turn begins post-response archival.
   try {
     claimThread(sessionId, turn);
   } catch (err) {
@@ -886,23 +874,107 @@ async function submitCodexResume(args) {
     return turn;
   }
 
-  // Create/get session and attach turn AFTER claimThread succeeds.
-  // Creating earlier would leave a stale session record on failed resume.
-  // Attaching earlier would overwrite the session's latestTurnId, making
-  // the real running turn unobservable if this setup fails.
+  if (existingSession?.archivePromise) {
+    await existingSession.archivePromise;
+  }
+  const previousSessionState = existingSession
+    ? {
+        latestTurnId: existingSession.latestTurnId,
+        activeTurnId: existingSession.activeTurnId,
+        archived: existingSession.archived,
+        archiveAttemptedTurnId: existingSession.archiveAttemptedTurnId,
+        archiveError: existingSession.archiveError,
+      }
+    : null;
+  if (existingSession) attachTurnToSession(existingSession, turn);
+
+  let server;
+  let threadUnarchivedDuringSetup = false;
+  const failResumeSetup = (err) => {
+    failTurn(turn, err, "setup");
+    if (
+      existingSession &&
+      previousSessionState &&
+      existingSession.latestTurnId === turn.id
+    ) {
+      Object.assign(existingSession, previousSessionState, {
+        updatedAt: Date.now(),
+      });
+      if (threadUnarchivedDuringSetup) {
+        existingSession.archived = false;
+        existingSession.archiveAttemptedTurnId = null;
+        if (server && !server.closed) {
+          turn.archiveAfterDeliveryServer = server;
+        }
+      }
+      const previousTurn = turns.get(previousSessionState.latestTurnId);
+      if (previousTurn?.resultDelivered) {
+        turn.archiveAfterDeliveryTurnId = previousSessionState.latestTurnId;
+      }
+      notifySessionWaiters(existingSession);
+    }
+    return turn;
+  };
+
+  try {
+    server = await getAppServer(cwd);
+  } catch (err) {
+    return failResumeSetup(err);
+  }
+
+  if (!server.loadedThreads.has(sessionId)) {
+    server.setupCount++;
+    try {
+      await resumeThread(server, sessionId, cwd);
+    } catch (err) {
+      threadUnarchivedDuringSetup ||= err.threadUnarchived === true;
+      server.setupCount--;
+      if (!retryableServerClose(server)) {
+        return failResumeSetup(err);
+      }
+      server = await getAppServer(cwd).catch(() => null);
+      if (!server) {
+        return failResumeSetup(err);
+      }
+      server.setupCount++;
+      try {
+        await resumeThread(server, sessionId, cwd);
+      } catch (retryErr) {
+        threadUnarchivedDuringSetup ||=
+          retryErr.threadUnarchived === true;
+        server.setupCount--;
+        return failResumeSetup(retryErr);
+      }
+    }
+    server.setupCount--;
+    server.loadedThreads.add(sessionId);
+  }
+
+  // Unknown sessions are only recorded after a successful resume. Known
+  // sessions were attached immediately after their archive settled, before
+  // any awaited setup, so post-delivery archival cannot race this reply.
   const session = getOrCreateSession(
     sessionId,
     cwd,
     existingSession?.persistent,
   );
-  attachTurnToSession(session, turn);
+  if (!existingSession) attachTurnToSession(session, turn);
 
-  runTurnCapture(turn, server, sessionId, () =>
+  const startTurn = () =>
     server.request("turn/start", {
       threadId: sessionId,
       input: [{ type: "text", text: prompt }],
-    }),
-  );
+    });
+
+  runTurnCapture(turn, server, sessionId, async () => {
+    try {
+      return await startTurn();
+    } catch (err) {
+      if (!isArchivedThreadError(err)) throw err;
+      await server.request("thread/unarchive", { threadId: sessionId });
+      return startTurn();
+    }
+  });
 
   return turn;
 }
@@ -1288,9 +1360,17 @@ async function handleToolCall(message) {
           : session
             ? snapshotSession(session)
             : snapshotFallback(turn);
-      sendResponse(message.id, {
+      await sendResponse(message.id, {
         content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
       });
+      if (turn.archiveAfterDeliveryTurnId) {
+        const previousSession = sessions.get(turn.sessionId);
+        await archiveSessionAfterDelivery(
+          previousSession,
+          turn.archiveAfterDeliveryTurnId,
+          turn.archiveAfterDeliveryServer,
+        );
+      }
       return;
     }
 
@@ -1301,6 +1381,8 @@ async function handleToolCall(message) {
         content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
       });
       if (snapshot.done) {
+        const deliveredTurn = turns.get(turnId);
+        if (deliveredTurn) deliveredTurn.resultDelivered = true;
         await archiveSessionAfterDelivery(session, turnId);
       }
       return;
@@ -1336,13 +1418,19 @@ async function handleToolCall(message) {
     }
 
     await sendResponse(message.id, { content });
+    result.turn.resultDelivered = true;
     const session = sessions.get(result.sessionId);
     await archiveSessionAfterDelivery(session, result.turn.id);
   } catch (e) {
     await sendError(message.id, -32603, e.message);
+    if (e.turn) e.turn.resultDelivered = true;
     if (e.turn?.sessionId) {
       const session = sessions.get(e.turn.sessionId);
-      await archiveSessionAfterDelivery(session, e.turn.id);
+      await archiveSessionAfterDelivery(
+        session,
+        e.turn.archiveAfterDeliveryTurnId || e.turn.id,
+        e.turn.archiveAfterDeliveryServer,
+      );
     }
   }
 }

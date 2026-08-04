@@ -18,8 +18,17 @@ const rl = readline.createInterface({ input: process.stdin });
 const stateFile = process.env.MOCK_STATE_FILE;
 const eventLog = process.env.MOCK_EVENT_LOG;
 const failArchive = process.env.MOCK_ARCHIVE_FAIL === "1";
+const failArchiveAfterApply =
+  process.env.MOCK_ARCHIVE_FAIL_AFTER_APPLY === "1";
+const timeoutArchiveAfterApply =
+  process.env.MOCK_ARCHIVE_TIMEOUT_AFTER_APPLY === "1";
 const archiveDelay =
   parseInt(process.env.MOCK_ARCHIVE_DELAY_MS, 10) || 0;
+const archiveEnforcement = process.env.MOCK_ARCHIVE_ENFORCE || "resume";
+const resumeDelay = parseInt(process.env.MOCK_RESUME_DELAY_MS, 10) || 0;
+const failResume = process.env.MOCK_RESUME_FAIL === "1";
+const failResumeAfterUnarchive =
+  process.env.MOCK_RESUME_FAIL_AFTER_UNARCHIVE === "1";
 
 // Track persistent state across mock app-server processes when requested.
 const threads = new Map();
@@ -34,6 +43,10 @@ if (stateFile && fs.existsSync(stateFile)) {
   }
 }
 let crashAfterTurnStart = process.env.MOCK_CRASH_AFTER_TURN_START === "1";
+const exitAfterReviewComplete =
+  process.env.MOCK_EXIT_AFTER_REVIEW_COMPLETE === "1";
+const exitAfterTurnComplete =
+  process.env.MOCK_EXIT_AFTER_TURN_COMPLETE === "1";
 let turnDelay = parseInt(process.env.MOCK_TURN_DELAY_MS, 10) || 0;
 
 function send(msg) {
@@ -108,19 +121,35 @@ rl.on("line", (line) => {
     case "thread/resume": {
       const threadId = params.threadId;
       const thread = threads.get(threadId);
-      if (thread?.archived) {
-        send({
-          id,
-          error: {
-            code: -32600,
-            message: `session ${threadId} is archived. Run codex unarchive ${threadId} first`,
-          },
-        });
-      } else if (thread) {
-        send({ id, result: { thread: { id: threadId, turns: [], status: "loaded" } } });
-      } else {
-        send({ id, error: { code: -32600, message: `no rollout found for thread id ${threadId}` } });
-      }
+      setTimeout(() => {
+        if (
+          failResume ||
+          (failResumeAfterUnarchive && thread?.unarchivedByTest)
+        ) {
+          send({
+            id,
+            error: {
+              code: -32600,
+              message: `no rollout found for thread id ${threadId}`,
+            },
+          });
+        } else if (
+          thread?.archived &&
+          (archiveEnforcement === "resume" || archiveEnforcement === "both")
+        ) {
+          send({
+            id,
+            error: {
+              code: -32600,
+              message: `session ${threadId} is archived. Run codex unarchive ${threadId} first`,
+            },
+          });
+        } else if (thread) {
+          send({ id, result: { thread: { id: threadId, turns: [], status: "loaded" } } });
+        } else {
+          send({ id, error: { code: -32600, message: `no rollout found for thread id ${threadId}` } });
+        }
+      }, resumeDelay);
       break;
     }
 
@@ -128,7 +157,18 @@ rl.on("line", (line) => {
       const threadId = params.threadId;
       const thread = threads.get(threadId);
       setTimeout(() => {
-        if (failArchive) {
+        if (timeoutArchiveAfterApply && thread) {
+          thread.archived = true;
+          saveThreads();
+          record("mock/archive-applied", { threadId });
+          // Simulate a live server that applied the request but lost its
+          // response. The client must time out and reconcile cached state.
+        } else if (failArchiveAfterApply && thread) {
+          thread.archived = true;
+          saveThreads();
+          record("mock/archive-applied", { threadId });
+          process.exit(1);
+        } else if (failArchive) {
           send({
             id,
             error: { code: -32603, message: "mock archive failure" },
@@ -144,6 +184,7 @@ rl.on("line", (line) => {
         } else {
           thread.archived = true;
           saveThreads();
+          record("mock/archive-applied", { threadId });
           send({ id, result: {} });
         }
       }, archiveDelay);
@@ -163,6 +204,7 @@ rl.on("line", (line) => {
         });
       } else {
         thread.archived = false;
+        thread.unarchivedByTest = true;
         saveThreads();
         send({ id, result: { thread: { id: threadId } } });
       }
@@ -171,6 +213,20 @@ rl.on("line", (line) => {
 
     case "turn/start": {
       const threadId = params.threadId;
+      const thread = threads.get(threadId);
+      if (
+        thread?.archived &&
+        (archiveEnforcement === "turn" || archiveEnforcement === "both")
+      ) {
+        send({
+          id,
+          error: {
+            code: -32600,
+            message: `session ${threadId} is archived. Run codex unarchive ${threadId} first`,
+          },
+        });
+        break;
+      }
       const turnId = `turn_${Date.now()}`;
 
       // Return the RPC response
@@ -201,6 +257,10 @@ rl.on("line", (line) => {
           method: "turn/completed",
           params: { threadId, turn: { id: turnId, status: "completed", items: [] } },
         });
+        if (exitAfterTurnComplete) {
+          record("mock/exiting-after-turn", { threadId });
+          setTimeout(() => process.exit(1), 10);
+        }
       }, turnDelay);
       break;
     }
@@ -226,6 +286,9 @@ rl.on("line", (line) => {
           method: "turn/completed",
           params: { threadId, turn: { id: turnId, status: "completed", items: [] } },
         });
+        if (exitAfterReviewComplete) {
+          setTimeout(() => process.exit(1), 10);
+        }
       }, turnDelay);
       break;
     }
