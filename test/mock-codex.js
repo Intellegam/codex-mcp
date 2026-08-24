@@ -12,6 +12,10 @@ if (process.argv[2] !== "app-server") {
   console.error("mock-codex: only app-server subcommand is supported");
   process.exit(1);
 }
+if (process.env.MOCK_REJECT_STARTUP === "1") {
+  console.error("mock-codex: rejected app-server configuration");
+  process.exit(1);
+}
 
 const rl = readline.createInterface({ input: process.stdin });
 
@@ -60,6 +64,8 @@ function record(method, params) {
     JSON.stringify({ method, params, at: Date.now() }) + "\n",
   );
 }
+
+record("mock/process-start", { argv: process.argv.slice(2) });
 
 function saveThreads() {
   if (!stateFile) return;

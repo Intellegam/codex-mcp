@@ -180,6 +180,27 @@ describe("MCP protocol", () => {
     expect(resp.result.protocolVersion).toBe("2024-11-05");
   });
 
+  test("passes the Claude bridge override to child Codex sessions", async () => {
+    server = spawnServer();
+    await server.mcpInit();
+    server.send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "codex", arguments: { prompt: "start child" } },
+    });
+    await server.waitResponse();
+
+    const processStart = server
+      .getMockEvents()
+      .find((event) => event.method === "mock/process-start");
+    expect(processStart.params.argv).toEqual([
+      "app-server",
+      "-c",
+      'mcp_servers.claude-agent={command="false",enabled=false}',
+    ]);
+  });
+
   test("tools/list returns 5 tools", async () => {
     server = spawnServer();
     await server.mcpInit();
@@ -601,6 +622,20 @@ describe("codex-review tool", () => {
 describe("timeout and error handling", () => {
   let server;
   afterEach(() => server?.close());
+
+  test("fails closed when app-server rejects guarded startup", async () => {
+    server = spawnServer({ MOCK_REJECT_STARTUP: "1" });
+    await server.mcpInit();
+    server.send({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "codex", arguments: { prompt: "blocked startup" } },
+    });
+
+    const resp = await server.waitResponse();
+    expect(resp.error.message).toContain("codex app-server exited (code 1)");
+  });
 
   test("times out and returns error", async () => {
     server = spawnServer({ MOCK_TURN_DELAY_MS: "60000", CODEX_TIMEOUT_MS: "500" });
