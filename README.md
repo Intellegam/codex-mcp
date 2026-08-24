@@ -203,6 +203,7 @@ This works for any combination of `codex`, `codex-reply`, and `codex-review` —
 Uses the Codex app-server JSON-RPC protocol instead of CLI subprocess calls:
 
 - **Per-connection lifecycle**: One `codex app-server` process per MCP connection, isolated between concurrent Claude sessions
+- **Bridge isolation**: Each child app-server disables the exact `claude-agent` MCP server identity to prevent recursive Claude → Codex → Claude bridge calls without changing the operator's normal Codex configuration. Alternate Claude bridge aliases are not covered.
 - **Formal protocol**: Bidirectional JSON-RPC 2.0 with typed requests/responses and streaming notifications
 - **Async-first engine**: Turns tracked in an in-memory Map with state machine and thread guards. Sync tools are thin wrappers that await completion
 - **Timeout protection**: Configurable timeouts with `turn/interrupt` on expiry and a 30s cancel watchdog to prevent ghost turns

@@ -17,12 +17,14 @@ const crypto = require("crypto");
 const path = require("path");
 const readline = require("readline");
 
-const VERSION = "3.2.8";
+const VERSION = "3.2.9";
 const TIMEOUT_MS =
   parseInt(process.env.CODEX_TIMEOUT_MS, 10) || 30 * 60 * 1000;
 const REQUEST_TIMEOUT_MS =
   parseInt(process.env.CODEX_REQUEST_TIMEOUT_MS, 10) || 5_000;
 const CANCEL_WATCHDOG_MS = 30_000;
+const CLAUDE_MCP_OVERRIDE =
+  'mcp_servers.claude-agent={command="false",enabled=false}';
 
 // ---------------------------------------------------------------------------
 // App Server Connection
@@ -42,7 +44,7 @@ class AppServerConnection {
   }
 
   async connect(cwd) {
-    this.proc = spawn("codex", ["app-server"], {
+    this.proc = spawn("codex", ["app-server", "-c", CLAUDE_MCP_OVERRIDE], {
       cwd: cwd || process.cwd(),
       env: process.env,
       stdio: ["pipe", "pipe", "pipe"],
