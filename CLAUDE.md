@@ -29,12 +29,23 @@ Single-file server (`server.js`) with an async-first turn engine:
 - `codex-result` - Get session status/result (supports `wait: true` to block until done)
 - `codex-cancel` - Cancel the active turn on a session
 
-## Development
+## Commands & Checks
+
+### Required Checks
+
+- Test: `bun test` (the repository's automated test suite)
+
+### Situational Checks
+
+- Real Codex integration smoke: `bun run test:smoke` when explicitly requested;
+  this invokes the installed Codex CLI and may consume model usage.
+
+### Manual Diagnostics
+
+The following commands operate real sessions; use only for an authorized
+integration investigation. They are not required for documentation-only edits.
 
 ```bash
-# Run tests
-bun test
-
 # Test locally (sync)
 node test/send.js codex "prompt"
 
