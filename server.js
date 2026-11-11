@@ -318,10 +318,14 @@ function createTurn({ toolName, cwd, timeoutMs }) {
     reviewText: "",
     error: null,
     resultDelivered: false,
+    resultDiscarded: false,
+    discardPromise: null,
     cancelRequested: false,
     cancelReason: null,
     interruptPending: false,
     interruptSent: false,
+    sawTurnStarted: false,
+    cancelWatchdog: null,
     server: null,
     archiveAfterDeliveryTurnId: null,
     archiveAfterDeliveryServer: null,
@@ -357,6 +361,7 @@ function settleTurn(turn, status, patch = {}) {
     output:
       patch.output ?? (turn.reviewText || turn.lastMessage || turn.output || ""),
   });
+  clearTimeout(turn.cancelWatchdog);
   if (turn.cleanup) turn.cleanup();
   releaseThreadClaim(turn);
 
@@ -476,25 +481,36 @@ function requestTurnCancel(turn, reason = "user") {
   if (!turn.cancelRequested) {
     turn.cancelRequested = true;
     turn.cancelReason = reason;
+    // Bound cancellation even while waiting for turn/started.
+    turn.cancelWatchdog = setTimeout(() => {
+      if (!isTerminal(turn.status)) {
+        const terminalStatus =
+          turn.cancelReason === "timeout" ? "timed_out" : "cancelled";
+        settleTurn(turn, terminalStatus, {
+          error: {
+            message: `Codex cancellation did not settle within ${CANCEL_WATCHDOG_MS / 1000}s`,
+            source: turn.cancelReason === "timeout" ? "timeout" : "cancel",
+          },
+        });
+      }
+    }, CANCEL_WATCHDOG_MS);
+    turn.cancelWatchdog.unref?.();
   }
 
-  // Always transition to cancelling — even if turnId isn't known yet.
-  // We keep the handler and thread claim alive until the start response
-  // arrives (which gives us the turnId to interrupt) or the turn settles.
+  // The start response can precede backend readiness; turn/started is the gate.
   if (turn.status !== "cancelling") updateTurn(turn, { status: "cancelling" });
 
-  if (turn.turnId) {
-    maybeSendInterrupt(turn);
-  } else {
-    turn.interruptPending = true;
-  }
+  turn.interruptPending = true;
+  maybeSendInterrupt(turn);
 
   return turn;
 }
 
 function maybeSendInterrupt(turn) {
-  if (turn.interruptSent || !turn.turnId || !turn.server || turn.server.closed)
-    return;
+  if (
+    turn.interruptSent || !turn.sawTurnStarted || !turn.turnId ||
+    !turn.server || turn.server.closed
+  ) return;
   turn.interruptPending = false;
   turn.interruptSent = true;
   turn.server
@@ -503,21 +519,6 @@ function maybeSendInterrupt(turn) {
       turnId: turn.turnId,
     })
     .catch(() => {});
-
-  // Watchdog: if the turn doesn't complete after interrupt, force-settle
-  const watchdog = setTimeout(() => {
-    if (!isTerminal(turn.status)) {
-      const terminalStatus =
-        turn.cancelReason === "timeout" ? "timed_out" : "cancelled";
-      settleTurn(turn, terminalStatus, {
-        error: {
-          message: `Codex did not respond to interrupt within ${CANCEL_WATCHDOG_MS / 1000}s`,
-          source: turn.cancelReason === "timeout" ? "timeout" : "cancel",
-        },
-      });
-    }
-  }, CANCEL_WATCHDOG_MS);
-  if (watchdog.unref) watchdog.unref();
 }
 
 // --- Turn capture (background) ---
@@ -552,7 +553,6 @@ function handleStartResponse(turn, response) {
   const appTurnId = response?.turn?.id;
   if (appTurnId) {
     turn.turnId = turn.turnId || appTurnId;
-    if (turn.interruptPending) maybeSendInterrupt(turn);
   }
 
   // Check for immediately terminal turns
@@ -580,6 +580,7 @@ function handleTurnNotification(turn, msg) {
 
   switch (msg.method) {
     case "turn/started":
+      turn.sawTurnStarted = true;
       turn.turnId = turn.turnId || msg.params?.turn?.id;
       if (turn.interruptPending) maybeSendInterrupt(turn);
       if (turn.status === "starting") updateTurn(turn, { status: "running" });
@@ -650,22 +651,20 @@ function notifySessionWaiters(session) {
 }
 
 function waitForSessionDone(session) {
+  const call = requestContext.getStore();
   return new Promise((resolve) => {
-    const turn = turns.get(session.latestTurnId);
-    if (!turn || isTerminal(turn.status)) {
+    const finish = () => {
+      session.waiters.delete(waiter);
+      if (call?.cancelWait === finish) call.cancelWait = null;
       resolve();
-      return;
-    }
-    const waiter = () => {
-      // Only resolve when the turn is terminal — ignore intermediate state changes
-      const t = turns.get(session.latestTurnId);
-      if (!t || isTerminal(t.status)) {
-        resolve();
-      } else {
-        session.waiters.add(waiter);
-      }
     };
-    session.waiters.add(waiter);
+    const waiter = () => {
+      const turn = turns.get(session.latestTurnId);
+      if (call?.cancelled || !turn || isTerminal(turn.status)) finish();
+      else session.waiters.add(waiter);
+    };
+    if (call?.modern) call.cancelWait = finish;
+    waiter();
   });
 }
 
@@ -720,7 +719,7 @@ async function resumeThread(server, sessionId, cwd) {
   }
 }
 
-function archiveSessionAfterDelivery(
+function archiveFinishedSession(
   session,
   deliveredTurnId,
   serverOverride = null,
@@ -734,7 +733,7 @@ function archiveSessionAfterDelivery(
   if (
     !turn ||
     !isTerminal(turn.status) ||
-    !turn.resultDelivered ||
+    !(turn.resultDelivered || turn.resultDiscarded) ||
     session.latestTurnId !== deliveredTurnId ||
     session.activeTurnId !== null
   ) {
@@ -1195,9 +1194,20 @@ mcpRl.on("line", async (line) => {
   if (!Object.hasOwn(message, "id")) {
     if (message.method === "notifications/cancelled") {
       const call = liveMcpRequests.get(message.params?.requestId);
-      if (call && !call.responded) {
+      if (call && !call.responded && !call.cancelled) {
         call.cancelled = true;
-        if (call.turn) requestTurnCancel(call.turn);
+        call.cancelWait?.();
+        if (call.turn) {
+          const turn = call.turn;
+          // Only a fresh start has a handle the caller never received.
+          if (turn.toolName === "codex") {
+            turn.resultDiscarded = true;
+            turn.discardPromise = turn.donePromise.then(() =>
+              archiveFinishedSession(sessions.get(turn.sessionId), turn.id),
+            );
+          }
+          requestTurnCancel(turn);
+        }
       }
     }
     return;
@@ -1417,7 +1427,7 @@ async function handleToolCall(message) {
       }))) return;
       if (turn.archiveAfterDeliveryTurnId) {
         const previousSession = sessions.get(turn.sessionId);
-        await archiveSessionAfterDelivery(
+        await archiveFinishedSession(
           previousSession,
           turn.archiveAfterDeliveryTurnId,
           turn.archiveAfterDeliveryServer,
@@ -1435,7 +1445,7 @@ async function handleToolCall(message) {
       if (snapshot.done) {
         const deliveredTurn = turns.get(turnId);
         if (deliveredTurn) deliveredTurn.resultDelivered = true;
-        await archiveSessionAfterDelivery(session, turnId);
+        await archiveFinishedSession(session, turnId);
       }
       return;
     }
@@ -1472,13 +1482,13 @@ async function handleToolCall(message) {
     if (!(await sendResponse(message.id, { content }))) return;
     result.turn.resultDelivered = true;
     const session = sessions.get(result.sessionId);
-    await archiveSessionAfterDelivery(session, result.turn.id);
+    await archiveFinishedSession(session, result.turn.id);
   } catch (e) {
     if (!(await sendError(message.id, -32603, e.message))) return;
     if (e.turn) e.turn.resultDelivered = true;
     if (e.turn?.sessionId) {
       const session = sessions.get(e.turn.sessionId);
-      await archiveSessionAfterDelivery(
+      await archiveFinishedSession(
         session,
         e.turn.archiveAfterDeliveryTurnId || e.turn.id,
         e.turn.archiveAfterDeliveryServer,
@@ -1546,12 +1556,12 @@ async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  // Let a just-flushed terminal response enter its post-delivery archive step,
-  // then give only those already-started archive operations time to settle.
+  // Allow delivered results and cancelled fresh starts to finish bounded cleanup.
   await new Promise((resolve) => setImmediate(resolve));
-  const pendingArchives = [...sessions.values()]
-    .map((session) => session.archivePromise)
-    .filter(Boolean);
+  const pendingArchives = [
+    ...[...sessions.values()].map((session) => session.archivePromise),
+    ...[...turns.values()].map((turn) => turn.discardPromise),
+  ].filter(Boolean);
   if (pendingArchives.length > 0) {
     await Promise.race([
       Promise.allSettled(pendingArchives),

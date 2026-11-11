@@ -52,6 +52,8 @@ const exitAfterReviewComplete =
 const exitAfterTurnComplete =
   process.env.MOCK_EXIT_AFTER_TURN_COMPLETE === "1";
 let turnDelay = parseInt(process.env.MOCK_TURN_DELAY_MS, 10) || 0;
+const startDelay = parseInt(process.env.MOCK_TURN_START_DELAY_MS, 10) || 0;
+const startedTurns = new Set();
 
 function send(msg) {
   process.stdout.write(JSON.stringify(msg) + "\n");
@@ -244,10 +246,12 @@ rl.on("line", (line) => {
         return;
       }
 
-      // Send notifications after a delay
       setTimeout(() => {
+        startedTurns.add(turnId);
+        record("mock/turn-ready", { threadId, turnId });
         send({ method: "turn/started", params: { threadId, turn: { id: turnId } } });
-
+      }, startDelay);
+      setTimeout(() => {
         const prompt = params.input?.[0]?.text || "";
         const responseText = `Mock response to: ${prompt}`;
 
@@ -267,7 +271,7 @@ rl.on("line", (line) => {
           record("mock/exiting-after-turn", { threadId });
           setTimeout(() => process.exit(1), 10);
         }
-      }, turnDelay);
+      }, startDelay + turnDelay);
       break;
     }
 
@@ -277,6 +281,10 @@ rl.on("line", (line) => {
 
       send({ id, result: { turn: { id: turnId, status: "inProgress", items: [] }, reviewThreadId: threadId } });
 
+      setTimeout(() => {
+        startedTurns.add(turnId);
+        send({ method: "turn/started", params: { threadId, turn: { id: turnId } } });
+      }, startDelay);
       setTimeout(() => {
         send({ method: "turn/started", params: { threadId, turn: { id: turnId } } });
 
@@ -295,11 +303,16 @@ rl.on("line", (line) => {
         if (exitAfterReviewComplete) {
           setTimeout(() => process.exit(1), 10);
         }
-      }, turnDelay);
+      }, startDelay + turnDelay);
       break;
     }
 
     case "turn/interrupt": {
+      if (process.env.MOCK_TURN_START_DELAY_MS && !startedTurns.has(params.turnId)) {
+        record("mock/early-interrupt-rejected", { threadId: params.threadId });
+        send({ id, error: { code: -32600, message: "turn is not active yet" } });
+        break;
+      }
       send({ id, result: {} });
       // Simulate the turn completing after interrupt
       const intThreadId = params.threadId;

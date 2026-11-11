@@ -1202,6 +1202,102 @@ describe("MCP 2026-07-28", () => {
     await new Promise((resolve) => setTimeout(resolve, 600));
     send(2, "ping");
     expect((await server.waitResponse()).id).toBe(2);
-    expect(server.getMockEvents().filter((e) => e.method === "thread/archive")).toEqual([]);
+    const archives = server.getMockEvents().filter((e) => e.method === "thread/archive");
+    expect(archives.length).toBe(1);
+    const events = server.getMockEvents();
+    expect(events.findIndex((e) => e.method === "thread/archive")).toBeGreaterThan(
+      events.findIndex((e) => e.method === "turn/interrupt"),
+    );
   });
+
+  test("cancelled async startup archives its never-delivered handle once", async () => {
+    server = spawnServer({ MOCK_TURN_DELAY_MS: "500", MOCK_TURN_START_DELAY_MS: "100" });
+    server.proc.stdin.write([
+      { jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+        name: "codex", arguments: { prompt: "cancel before handle", async: true }, _meta: meta(),
+      } },
+      { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } },
+      { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } },
+      { jsonrpc: "2.0", id: 2, method: "ping", params: { _meta: meta() } },
+    ].map((message) => JSON.stringify(message)).join("\n") + "\n");
+    expect((await server.waitResponse()).id).toBe(2);
+    await waitForMockMethod(server, "thread/archive");
+    const eventOrder = server.getMockEvents();
+    expect(eventOrder.some((e) => e.method === "mock/early-interrupt-rejected")).toBe(false);
+    expect(eventOrder.findIndex((e) => e.method === "turn/interrupt")).toBeGreaterThan(
+      eventOrder.findIndex((e) => e.method === "mock/turn-ready"),
+    );
+    send(3, "ping");
+    expect((await server.waitResponse()).id).toBe(3);
+    expect(server.getMockEvents().filter((event) => event.method === "thread/archive").length).toBe(1);
+  });
+
+  test("cancelled polling releases its request without interrupting the known session", async () => {
+    server = spawnServer({ MOCK_TURN_DELAY_MS: "500" });
+    send(1, "tools/call", { name: "codex", arguments: { prompt: "keep running", async: true } });
+    const { sessionId } = JSON.parse((await server.waitResponse()).result.content[0].text);
+    server.proc.stdin.write([
+      { jsonrpc: "2.0", id: 2, method: "tools/call", params: {
+        name: "codex-result", arguments: { sessionId, wait: true }, _meta: meta(),
+      } },
+      { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 2 } },
+      { jsonrpc: "2.0", id: 3, method: "ping", params: { _meta: meta() } },
+    ].map((message) => JSON.stringify(message)).join("\n") + "\n");
+    expect((await server.waitResponse()).id).toBe(3);
+    expect(server.getMockEvents().some((event) => event.method === "turn/interrupt")).toBe(false);
+    send(4, "tools/call", { name: "codex-result", arguments: { sessionId, wait: true } });
+    const response = await server.waitResponse();
+    expect(response.id).toBe(4);
+    expect(JSON.parse(response.result.content[0].text).status).toBe("succeeded");
+    await waitForMockMethod(server, "thread/archive");
+  });
+
+  test("cancelled reply remains reachable until a terminal result is delivered", async () => {
+    server = spawnServer({ MOCK_TURN_DELAY_MS: "100" });
+    send(1, "tools/call", { name: "codex", arguments: { prompt: "first", async: true } });
+    const { sessionId } = JSON.parse((await server.waitResponse()).result.content[0].text);
+    send(2, "tools/call", { name: "codex-result", arguments: { sessionId, wait: true } });
+    await server.waitResponse();
+    await waitForMockMethod(server, "thread/archive");
+    send(3, "tools/call", { name: "codex-reply", arguments: { sessionId, prompt: "cancel reply" } });
+    await waitForCondition(() => server.getMockEvents().filter((e) => e.method === "turn/start").length === 2,
+      "reply did not start");
+    server.send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 3 } });
+    await waitForMockMethod(server, "turn/interrupt");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(server.getMockEvents().filter((e) => e.method === "thread/archive").length).toBe(1);
+    send(4, "tools/call", { name: "codex-result", arguments: { sessionId, wait: true } });
+    const response = await server.waitResponse();
+    expect(response.id).toBe(4);
+    expect(JSON.parse(response.result.content[0].text).done).toBe(true);
+    await waitForCondition(() => server.getMockEvents().filter((e) => e.method === "thread/archive").length === 2,
+      "delivered terminal reply was not archived");
+  });
+
+
+  test("cancelled ephemeral review is interrupted without persistent archival", async () => {
+    server = spawnServer({ MOCK_TURN_DELAY_MS: "500", MOCK_TURN_START_DELAY_MS: "100" });
+    send(1, "tools/call", { name: "codex-review", arguments: { mode: "uncommitted" } });
+    await waitForMockMethod(server, "review/start");
+    server.send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } });
+    await waitForMockMethod(server, "turn/interrupt");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    send(2, "ping");
+    expect((await server.waitResponse()).id).toBe(2);
+    expect(server.getMockEvents().some((e) => e.method === "thread/archive")).toBe(false);
+    expect(server.getMockEvents().some((e) => e.method === "mock/early-interrupt-rejected")).toBe(false);
+  });
+
+  test("shutdown grants cancelled fresh startup time to archive", async () => {
+    server = spawnServer({ MOCK_TURN_DELAY_MS: "500", MOCK_TURN_START_DELAY_MS: "100" });
+    server.proc.stdin.write([
+      { jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+        name: "codex", arguments: { prompt: "cancel then exit", async: true }, _meta: meta(),
+      } },
+      { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } },
+    ].map((message) => JSON.stringify(message)).join("\n") + "\n");
+    expect(await server.endInputAndWait()).toBe(0);
+    expect(server.getMockEvents().filter((e) => e.method === "thread/archive").length).toBe(1);
+  });
+
 });

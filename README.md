@@ -23,12 +23,18 @@ permissions and async behavior are the same on both paths.
 
 Stdio uses local server and agent processes; running turns and polling snapshots
 remain process-local. This protocol change provides no restart durability or
-measured resource savings.
+measured resource savings. Sharing a bridge across chats requires host connection
+pooling or a shared service; changing protocol versions alone does not provide it.
 
 Claude Code's v2 MCP runtime supports this revision. A discovery-only probe
 with Claude Code 2.1.317 and `DISABLE_TELEMETRY=1` on 2026-11-11 received
 `server/discover` followed by `tools/list` on the new revision, with no model
 request. Legacy runtimes continue through `initialize`.
+
+Modern `notifications/cancelled` interrupts only the turn submitted by that
+request; cancelled replies keep their known handles available for polling.
+Cancelling a result wait releases the waiter without stopping the agent. Legacy
+MCP requests retain their existing tool-based `codex-cancel` behavior.
 
 ### Tasks
 
@@ -186,6 +192,8 @@ follow-up while their original app-server connection is alive.
 - `codex-review` creates an ephemeral Codex thread.
 - `codex` creates a persistent thread. Persistent threads are archived after a
   synchronous terminal response has been written to the MCP caller.
+- A modern request cancelled before a fresh session handle is delivered archives
+  that session after its turn settles, including async startup cancellation.
 - In async mode, persistent threads remain unarchived until `codex-result`
   delivers a terminal snapshot. A `codex-cancel` response alone does not
   archive the thread.
