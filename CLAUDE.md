@@ -12,7 +12,8 @@ Consult `README.md` for setup and usage when needed.
 
 ## Architecture
 
-Single-file server (`server.js`) with an async-first turn engine:
+Server (`server.js`) with request-scoped protocol helpers (`mcp-protocol.js`)
+and an async-first turn engine:
 
 1. Receives MCP JSON-RPC messages on stdin
 2. Spawns a single `codex app-server` process per MCP connection

@@ -12,6 +12,32 @@ An MCP server that communicates with Codex via the [app-server](https://develope
 6. Enforces configurable timeouts (default 30 minutes) to prevent indefinite hangs
 7. Supports async mode — return a sessionId immediately and poll for results
 
+## MCP protocol compatibility
+
+The server supports [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)
+over local stdio, alongside the existing `2024-11-05` initialization path.
+Modern clients use `server/discover` and per-request version/capability metadata;
+no MCP initialization handshake is needed. Discovery and the deterministic tool
+catalog carry five-minute public cache hints. Tool arguments, session handles,
+permissions and async behavior are the same on both paths.
+
+Stdio uses local server and agent processes; running turns and polling snapshots
+remain process-local. This protocol change provides no restart durability or
+measured resource savings.
+
+Claude Code's v2 MCP runtime supports this revision. A discovery-only probe
+with Claude Code 2.1.317 and `DISABLE_TELEMETRY=1` on 2026-11-11 received
+`server/discover` followed by `tools/list` on the new revision, with no model
+request. Legacy runtimes continue through `initialize`.
+
+### Tasks
+
+The [Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overview)
+is not advertised: this bridge retains its existing async tools. Native Tasks
+requires durable task creation and result retrieval across reconnects. Claude
+Code Tasks support is public beta on selected CLI/SDK surfaces, excluding
+desktop and VS Code.
+
 ## Prerequisites
 
 - Node.js 18.0 or higher

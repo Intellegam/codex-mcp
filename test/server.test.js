@@ -176,7 +176,7 @@ describe("MCP protocol", () => {
     server = spawnServer();
     const resp = await server.mcpInit();
     expect(resp.result.serverInfo.name).toBe("codex-mcp");
-    expect(resp.result.serverInfo.version).toBe("3.2.9");
+    expect(resp.result.serverInfo.version).toBe("3.3.0");
     expect(resp.result.protocolVersion).toBe("2024-11-05");
   });
 
@@ -1100,5 +1100,108 @@ describe("async error handling", () => {
     expect(snap.error.source).toBe("setup");
     expect(snap.error.message).toContain("codex-review requires mode");
     expect(snap.sessionId).toBeNull();
+  });
+});
+
+
+describe("MCP 2026-07-28", () => {
+  let server;
+  afterEach(() => server?.close());
+  const meta = (version = "2026-07-28", capabilities = {}) => ({
+    "io.modelcontextprotocol/protocolVersion": version,
+    "io.modelcontextprotocol/clientCapabilities": capabilities,
+  });
+  function send(id, method, params = {}, metadata = meta()) {
+    server.send({ jsonrpc: "2.0", id, method, params: { ...params, _meta: metadata } });
+  }
+
+  test("discovery and catalog need no initialize or agent process", async () => {
+    server = spawnServer();
+    send(1, "server/discover");
+    const discover = (await server.waitResponse()).result;
+    expect(discover.resultType).toBe("complete");
+    expect(discover.supportedVersions).toEqual(["2026-07-28"]);
+    expect(discover._meta["io.modelcontextprotocol/serverInfo"].name).toBe("codex-mcp");
+    expect(discover.instructions).toContain("read-only");
+    expect(discover.capabilities).toEqual({ tools: {} });
+    send(2, "tools/list");
+    const first = (await server.waitResponse()).result;
+    send(3, "tools/list");
+    expect((await server.waitResponse()).result).toEqual(first);
+    expect(first.resultType).toBe("complete");
+    expect(first.cacheScope).toBe("public");
+    expect(first.ttlMs).toBe(300000);
+    expect(first.tools.length).toBe(5);
+    expect(server.getMockEvents()).toEqual([]);
+  });
+
+  test("invalid metadata is rejected before agent work and does not poison the next request", async () => {
+    server = spawnServer();
+    const invalid = [
+      [{}, -32602],
+      [meta("2099-01-01"), -32022],
+      [meta("2026-07-28", null), -32602],
+      [meta("2026-07-28", []), -32602],
+    ];
+    let id = 0;
+    for (const [metadata, code] of invalid) {
+      send(++id, "server/discover", {}, metadata);
+      const response = await server.waitResponse();
+      expect(response.error.code).toBe(code);
+      if (code === -32022) expect(response.error.data).toEqual({
+        supported: ["2026-07-28"], requested: "2099-01-01",
+      });
+    }
+    send(++id, "ping");
+    expect((await server.waitResponse()).result.resultType).toBe("complete");
+    expect(server.getMockEvents()).toEqual([]);
+  });
+
+  test("old and new requests overlap without leaking response format", async () => {
+    server = spawnServer({ MOCK_TURN_DELAY_MS: "100" });
+    send(1, "tools/call", { name: "codex", arguments: { prompt: "modern" } });
+    server.send({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+    const legacy = await server.waitResponse();
+    expect(legacy.id).toBe(2);
+    expect(legacy.result.resultType).toBeUndefined();
+    const modern = await server.waitResponse();
+    expect(modern.id).toBe(1);
+    expect(modern.result.resultType).toBe("complete");
+    expect(modern.result.content[0].text).toContain("modern");
+    const init = await server.mcpInit();
+    expect(init.result.protocolVersion).toBe("2024-11-05");
+    expect(init.result.resultType).toBeUndefined();
+    send(3, "ping");
+    expect((await server.waitResponse()).result.resultType).toBe("complete");
+  });
+
+  test("async submit, poll, reply and cancel work without discovery", async () => {
+    server = spawnServer({ MOCK_TURN_DELAY_MS: "100" });
+    send(1, "tools/call", { name: "codex", arguments: { prompt: "async", async: true } });
+    const submitted = JSON.parse((await server.waitResponse()).result.content[0].text);
+    expect(submitted.sessionId).toMatch(/^thr_/);
+    send(2, "tools/call", { name: "codex-result", arguments: { sessionId: submitted.sessionId, wait: true } });
+    const done = JSON.parse((await server.waitResponse()).result.content[0].text);
+    expect(done.status).toBe("succeeded");
+    send(3, "tools/call", { name: "codex-reply", arguments: { sessionId: submitted.sessionId, prompt: "again", async: true } });
+    expect((await server.waitResponse()).result.resultType).toBe("complete");
+    send(4, "tools/call", { name: "codex-cancel", arguments: { sessionId: submitted.sessionId } });
+    expect((await server.waitResponse()).result.resultType).toBe("complete");
+  });
+
+  test("cancelled sync request is interrupted and silent after id reuse", async () => {
+    server = spawnServer({ MOCK_TURN_DELAY_MS: "500" });
+    send(1, "tools/call", { name: "codex", arguments: { prompt: "cancel me" } });
+    await waitForMockMethod(server, "turn/start");
+    server.send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } });
+    send(1, "ping");
+    const reused = await server.waitResponse();
+    expect(reused.id).toBe(1);
+    expect(reused.result.resultType).toBe("complete");
+    await waitForMockMethod(server, "turn/interrupt");
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    send(2, "ping");
+    expect((await server.waitResponse()).id).toBe(2);
+    expect(server.getMockEvents().filter((e) => e.method === "thread/archive")).toEqual([]);
   });
 });

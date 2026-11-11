@@ -16,8 +16,12 @@ const { spawn } = require("child_process");
 const crypto = require("crypto");
 const path = require("path");
 const readline = require("readline");
+const { AsyncLocalStorage } = require("node:async_hooks");
+const { LEGACY_VERSION, CATALOG_CACHE, requestProtocol, completeResult, discovery } = require("./mcp-protocol.js");
+const requestContext = new AsyncLocalStorage();
+const liveMcpRequests = new Map();
 
-const VERSION = "3.2.9";
+const VERSION = "3.3.0";
 const TIMEOUT_MS =
   parseInt(process.env.CODEX_TIMEOUT_MS, 10) || 30 * 60 * 1000;
 const REQUEST_TIMEOUT_MS =
@@ -325,6 +329,11 @@ function createTurn({ toolName, cwd, timeoutMs }) {
     resolveDone,
     cleanup: null,
   };
+  const call = requestContext.getStore();
+  if (call?.modern) {
+    call.turn = turn;
+    if (call.cancelled) requestTurnCancel(turn);
+  }
   turns.set(id, turn);
   return turn;
 }
@@ -1171,39 +1180,80 @@ const mcpRl = readline.createInterface({
 });
 
 mcpRl.on("line", async (line) => {
+  let message;
   try {
-    const message = JSON.parse(line);
-
-    switch (message.method) {
-      case "initialize":
-        handleInitialize(message);
-        break;
-
-      case "initialized":
-        break;
-
-      case "tools/list":
-        handleToolsList(message);
-        break;
-
-      case "tools/call":
-        await handleToolCall(message);
-        break;
-
-      default:
-        if (message.id !== undefined) {
-          sendError(message.id, -32601, "Method not found");
-        }
-        // Silently ignore unknown notifications (no id)
+    message = JSON.parse(line);
+  } catch {
+    await sendError(null, -32700, "Parse error");
+    return;
+  }
+  if (!message || Array.isArray(message) || message.jsonrpc !== "2.0" ||
+      typeof message.method !== "string") {
+    await sendError(message?.id ?? null, -32600, "Invalid Request");
+    return;
+  }
+  if (!Object.hasOwn(message, "id")) {
+    if (message.method === "notifications/cancelled") {
+      const call = liveMcpRequests.get(message.params?.requestId);
+      if (call && !call.responded) {
+        call.cancelled = true;
+        if (call.turn) requestTurnCancel(call.turn);
+      }
     }
-  } catch (e) {
-    console.error("Error processing message:", e);
+    return;
+  }
+  let context;
+  try {
+    context = requestProtocol(message);
+  } catch (error) {
+    await sendError(message.id, error.code, error.message, error.data);
+    return;
+  }
+  if (context.modern && liveMcpRequests.has(message.id) &&
+      !liveMcpRequests.get(message.id).cancelled &&
+      !liveMcpRequests.get(message.id).responded) {
+    await sendError(message.id, -32600, "Request id is already in flight");
+    return;
+  }
+  if (context.modern) liveMcpRequests.set(message.id, context);
+  try {
+    await requestContext.run(context, async () => {
+      switch (message.method) {
+        case "server/discover":
+          await sendResponse(message.id, discovery(INSTRUCTIONS));
+          break;
+        case "initialize":
+          if (context.modern) {
+            await sendError(message.id, -32601, "Use server/discover instead of initialize");
+          } else {
+            await handleInitialize(message);
+          }
+          break;
+        case "ping":
+          await sendResponse(message.id, {});
+          break;
+        case "tools/list":
+          await handleToolsList(message);
+          break;
+        case "tools/call":
+          await handleToolCall(message);
+          break;
+        default:
+          await sendError(message.id, -32601, "Method not found");
+      }
+    });
+  } catch (error) {
+    await requestContext.run(context, () => sendError(message.id, -32603, error.message));
+  } finally {
+    if (liveMcpRequests.get(message.id) === context) liveMcpRequests.delete(message.id);
   }
 });
 
+const INSTRUCTIONS = "Read the `collaborating-with-codex` skill before using these tools. Codex is an external AI agent for second opinions, planning, and code review — form your own analysis first to avoid anchoring bias. `codex` defaults to read-only; `writable: true` allows file writes and commands and must be explicitly scoped in the prompt. `async: true` on `codex`, `codex-reply`, and `codex-review` returns a sessionId immediately instead of blocking; poll with `codex-result` (use `wait: true` to block until done) and stop with `codex-cancel`. Session IDs work across `codex-reply`, `codex-result`, and `codex-cancel`.";
+
 function handleInitialize(message) {
-  sendResponse(message.id, {
-    protocolVersion: "2024-11-05",
+  return sendResponse(message.id, {
+    protocolVersion: LEGACY_VERSION,
     capabilities: {
       tools: {},
     },
@@ -1211,13 +1261,13 @@ function handleInitialize(message) {
       name: "codex-mcp",
       version: VERSION,
     },
-    instructions:
-      "Read the `collaborating-with-codex` skill before using these tools. Codex is an external AI agent for second opinions, planning, and code review — form your own analysis first to avoid anchoring bias. `codex` defaults to read-only; `writable: true` allows file writes and commands and must be explicitly scoped in the prompt. `async: true` on `codex`, `codex-reply`, and `codex-review` returns a sessionId immediately instead of blocking; poll with `codex-result` (use `wait: true` to block until done) and stop with `codex-cancel`. Session IDs work across `codex-reply`, `codex-result`, and `codex-cancel`.",
+    instructions: INSTRUCTIONS,
   });
 }
 
 function handleToolsList(message) {
-  sendResponse(message.id, {
+  return sendResponse(message.id, {
+    ...(requestContext.getStore()?.modern ? CATALOG_CACHE : {}),
     tools: [
       {
         name: "codex",
@@ -1362,9 +1412,9 @@ async function handleToolCall(message) {
           : session
             ? snapshotSession(session)
             : snapshotFallback(turn);
-      await sendResponse(message.id, {
+      if (!(await sendResponse(message.id, {
         content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
-      });
+      }))) return;
       if (turn.archiveAfterDeliveryTurnId) {
         const previousSession = sessions.get(turn.sessionId);
         await archiveSessionAfterDelivery(
@@ -1379,9 +1429,9 @@ async function handleToolCall(message) {
     // --- Session tools ---
     if (name === "codex-result") {
       const { snapshot, session, turnId } = await runCodexResult(args);
-      await sendResponse(message.id, {
+      if (!(await sendResponse(message.id, {
         content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
-      });
+      }))) return;
       if (snapshot.done) {
         const deliveredTurn = turns.get(turnId);
         if (deliveredTurn) deliveredTurn.resultDelivered = true;
@@ -1392,9 +1442,9 @@ async function handleToolCall(message) {
 
     if (name === "codex-cancel") {
       const snapshot = runCodexCancel(args);
-      await sendResponse(message.id, {
+      if (!(await sendResponse(message.id, {
         content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
-      });
+      }))) return;
       return;
     }
 
@@ -1419,12 +1469,12 @@ async function handleToolCall(message) {
       });
     }
 
-    await sendResponse(message.id, { content });
+    if (!(await sendResponse(message.id, { content }))) return;
     result.turn.resultDelivered = true;
     const session = sessions.get(result.sessionId);
     await archiveSessionAfterDelivery(session, result.turn.id);
   } catch (e) {
-    await sendError(message.id, -32603, e.message);
+    if (!(await sendError(message.id, -32603, e.message))) return;
     if (e.turn) e.turn.resultDelivered = true;
     if (e.turn?.sessionId) {
       const session = sessions.get(e.turn.sessionId);
@@ -1462,20 +1512,27 @@ function snapshotFallback(turn) {
 // ---------------------------------------------------------------------------
 
 function sendResponse(id, result) {
+  const context = requestContext.getStore();
+  if (context?.cancelled) return Promise.resolve(false);
+  if (context) context.responded = true;
+  result = completeResult(result, context, { name: "codex-mcp", version: VERSION });
   return writeMcpMessage({ jsonrpc: "2.0", id, result });
 }
 
-function sendError(id, code, message) {
+function sendError(id, code, message, data) {
+  const context = requestContext.getStore();
+  if (context?.cancelled) return Promise.resolve(false);
+  if (context) context.responded = true;
   return writeMcpMessage({
     jsonrpc: "2.0",
     id,
-    error: { code, message },
+    error: { code, message, ...(data === undefined ? {} : { data }) },
   });
 }
 
 function writeMcpMessage(message) {
   return new Promise((resolve) => {
-    process.stdout.write(JSON.stringify(message) + "\n", resolve);
+    process.stdout.write(JSON.stringify(message) + "\n", () => resolve(true));
   });
 }
 
