@@ -12,6 +12,38 @@ An MCP server that communicates with Codex via the [app-server](https://develope
 6. Enforces configurable timeouts (default 30 minutes) to prevent indefinite hangs
 7. Supports async mode — return a sessionId immediately and poll for results
 
+## MCP protocol compatibility
+
+The server supports [MCP 2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning)
+over local stdio, alongside the existing `2024-11-05` initialization path.
+Modern clients use `server/discover` and per-request version/capability metadata;
+no MCP initialization handshake is needed. Discovery and the deterministic tool
+catalog carry five-minute public cache hints. Tool arguments, session handles,
+permissions and async behavior are the same on both paths.
+
+Stdio uses local server and agent processes; running turns and polling snapshots
+remain process-local. This protocol change provides no restart durability or
+measured resource savings. Sharing a bridge across chats requires host connection
+pooling or a shared service; changing protocol versions alone does not provide it.
+
+Claude Code's v2 MCP runtime supports this revision. A discovery-only probe
+with Claude Code 2.1.317 and `DISABLE_TELEMETRY=1` on 2026-11-11 received
+`server/discover` followed by `tools/list` on the new revision, with no model
+request. Legacy runtimes continue through `initialize`.
+
+Modern `notifications/cancelled` interrupts only the turn submitted by that
+request; cancelled replies keep their known handles available for polling.
+Cancelling a result wait releases the waiter without stopping the agent. Legacy
+MCP requests retain their existing tool-based `codex-cancel` behavior.
+
+### Tasks
+
+The [Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overview)
+is not advertised: this bridge retains its existing async tools. Native Tasks
+requires durable task creation and result retrieval across reconnects. Claude
+Code Tasks support is public beta on selected CLI/SDK surfaces, excluding
+desktop and VS Code.
+
 ## Prerequisites
 
 - Node.js 18.0 or higher
@@ -160,6 +192,8 @@ follow-up while their original app-server connection is alive.
 - `codex-review` creates an ephemeral Codex thread.
 - `codex` creates a persistent thread. Persistent threads are archived after a
   synchronous terminal response has been written to the MCP caller.
+- A modern request cancelled before a fresh session handle is delivered archives
+  that session after its turn settles, including async startup cancellation.
 - In async mode, persistent threads remain unarchived until `codex-result`
   delivers a terminal snapshot. A `codex-cancel` response alone does not
   archive the thread.
@@ -196,6 +230,7 @@ This works for any combination of `codex`, `codex-reply`, and `codex-review` —
 | Environment Variable        | Default            | Description                                             |
 | --------------------------- | ------------------ | ------------------------------------------------------- |
 | `CODEX_TIMEOUT_MS`          | `1800000` (30 min) | Maximum time to wait for a Codex turn to complete       |
+| `CODEX_CANCEL_WATCHDOG_MS` | `30000` (30 sec) | After cancellation, release a synchronous caller with an error if backend settlement is still pending |
 | `CODEX_REQUEST_TIMEOUT_MS`  | `5000` (5 sec)     | Maximum time to wait for an app-server request response |
 
 ## Architecture
@@ -206,10 +241,11 @@ Uses the Codex app-server JSON-RPC protocol instead of CLI subprocess calls:
 - **Bridge isolation**: Each child app-server disables the exact `claude-agent` MCP server identity to prevent recursive Claude → Codex → Claude bridge calls without changing the operator's normal Codex configuration. Alternate Claude bridge aliases are not covered.
 - **Formal protocol**: Bidirectional JSON-RPC 2.0 with typed requests/responses and streaming notifications
 - **Async-first engine**: Turns tracked in an in-memory Map with state machine and thread guards. Sync tools are thin wrappers that await completion
-- **Timeout protection**: Configurable timeouts with `turn/interrupt` on expiry and a 30s cancel watchdog to prevent ghost turns
+- **Timeout protection**: Configurable timeouts with `turn/interrupt` on expiry and a 30s cancel watchdog that bounds the caller wait while retaining backend tracking and thread guards until actual completion
 - **Clean shutdown**: On SIGINT, SIGTERM, or stdin close, already-started
-  post-delivery archival gets a bounded chance to settle before the app server
-  is terminated
+  post-delivery or discarded-session archival gets a bounded chance to settle
+  before the app server is terminated. Forced shutdown cannot guarantee archival
+  of a backend turn that has not stopped within that grace period
 - **Session resume**: Non-ephemeral threads are persisted by Codex. Archived
   threads are automatically unarchived when either `thread/resume` or
   `turn/start` reports archived state, using `threadId` + `cwd` when a fresh

@@ -16,13 +16,20 @@ const { spawn } = require("child_process");
 const crypto = require("crypto");
 const path = require("path");
 const readline = require("readline");
+const { AsyncLocalStorage } = require("node:async_hooks");
+const { LEGACY_VERSION, CATALOG_CACHE, requestProtocol, completeResult, discovery } = require("./mcp-protocol.js");
+const requestContext = new AsyncLocalStorage();
+const liveMcpRequests = new Map();
 
-const VERSION = "3.2.9";
+const VERSION = "3.3.0";
 const TIMEOUT_MS =
   parseInt(process.env.CODEX_TIMEOUT_MS, 10) || 30 * 60 * 1000;
 const REQUEST_TIMEOUT_MS =
   parseInt(process.env.CODEX_REQUEST_TIMEOUT_MS, 10) || 5_000;
-const CANCEL_WATCHDOG_MS = 30_000;
+const cancelWatchdogSetting = Number(process.env.CODEX_CANCEL_WATCHDOG_MS);
+const CANCEL_WATCHDOG_MS = Number.isSafeInteger(cancelWatchdogSetting) &&
+  cancelWatchdogSetting > 0 && cancelWatchdogSetting <= 2_147_483_647
+  ? cancelWatchdogSetting : 30_000;
 const CLAUDE_MCP_OVERRIDE =
   'mcp_servers.claude-agent={command="false",enabled=false}';
 
@@ -295,6 +302,8 @@ function createTurn({ toolName, cwd, timeoutMs }) {
   const donePromise = new Promise((resolve) => {
     resolveDone = resolve;
   });
+  let resolveCallerDone;
+  const callerDonePromise = new Promise((resolve) => { resolveCallerDone = resolve; });
   const turn = {
     id,
     toolName,
@@ -314,17 +323,28 @@ function createTurn({ toolName, cwd, timeoutMs }) {
     reviewText: "",
     error: null,
     resultDelivered: false,
+    resultDiscarded: false,
+    archiveAfterSettlement: null,
     cancelRequested: false,
     cancelReason: null,
     interruptPending: false,
     interruptSent: false,
+    sawTurnStarted: false,
+    cancelWatchdog: null,
     server: null,
     archiveAfterDeliveryTurnId: null,
     archiveAfterDeliveryServer: null,
     donePromise,
     resolveDone,
+    callerDonePromise,
+    resolveCallerDone,
     cleanup: null,
   };
+  const call = requestContext.getStore();
+  if (call?.modern) {
+    call.turn = turn;
+    if (call.cancelled) requestTurnCancel(turn);
+  }
   turns.set(id, turn);
   return turn;
 }
@@ -348,6 +368,7 @@ function settleTurn(turn, status, patch = {}) {
     output:
       patch.output ?? (turn.reviewText || turn.lastMessage || turn.output || ""),
   });
+  clearTimeout(turn.cancelWatchdog);
   if (turn.cleanup) turn.cleanup();
   releaseThreadClaim(turn);
 
@@ -362,6 +383,7 @@ function settleTurn(turn, status, patch = {}) {
   }
 
   turn.resolveDone(turn);
+  turn.resolveCallerDone(turn);
 }
 
 function failTurn(turn, err, source) {
@@ -467,25 +489,33 @@ function requestTurnCancel(turn, reason = "user") {
   if (!turn.cancelRequested) {
     turn.cancelRequested = true;
     turn.cancelReason = reason;
+    turn.cancelWatchdog = setTimeout(() => {
+      if (isTerminal(turn.status)) return;
+      // A caller timeout is not proof that the backend released the thread.
+      updateTurn(turn, { error: {
+        message: `Codex cancellation is still pending after ${CANCEL_WATCHDOG_MS / 1000}s; awaiting backend settlement`,
+        source: turn.cancelReason === "timeout" ? "timeout" : "cancel",
+      } });
+      console.error(`[codex-mcp] ${turn.error.message} (turn ${turn.id})`);
+      turn.resolveCallerDone(turn);
+    }, CANCEL_WATCHDOG_MS);
+    turn.cancelWatchdog.unref?.();
   }
 
-  // Always transition to cancelling — even if turnId isn't known yet.
-  // We keep the handler and thread claim alive until the start response
-  // arrives (which gives us the turnId to interrupt) or the turn settles.
+  // The start response can precede backend readiness; turn/started is the gate.
   if (turn.status !== "cancelling") updateTurn(turn, { status: "cancelling" });
 
-  if (turn.turnId) {
-    maybeSendInterrupt(turn);
-  } else {
-    turn.interruptPending = true;
-  }
+  turn.interruptPending = true;
+  maybeSendInterrupt(turn);
 
   return turn;
 }
 
 function maybeSendInterrupt(turn) {
-  if (turn.interruptSent || !turn.turnId || !turn.server || turn.server.closed)
-    return;
+  if (
+    turn.interruptSent || !turn.sawTurnStarted || !turn.turnId ||
+    !turn.server || turn.server.closed
+  ) return;
   turn.interruptPending = false;
   turn.interruptSent = true;
   turn.server
@@ -494,21 +524,6 @@ function maybeSendInterrupt(turn) {
       turnId: turn.turnId,
     })
     .catch(() => {});
-
-  // Watchdog: if the turn doesn't complete after interrupt, force-settle
-  const watchdog = setTimeout(() => {
-    if (!isTerminal(turn.status)) {
-      const terminalStatus =
-        turn.cancelReason === "timeout" ? "timed_out" : "cancelled";
-      settleTurn(turn, terminalStatus, {
-        error: {
-          message: `Codex did not respond to interrupt within ${CANCEL_WATCHDOG_MS / 1000}s`,
-          source: turn.cancelReason === "timeout" ? "timeout" : "cancel",
-        },
-      });
-    }
-  }, CANCEL_WATCHDOG_MS);
-  if (watchdog.unref) watchdog.unref();
 }
 
 // --- Turn capture (background) ---
@@ -543,7 +558,6 @@ function handleStartResponse(turn, response) {
   const appTurnId = response?.turn?.id;
   if (appTurnId) {
     turn.turnId = turn.turnId || appTurnId;
-    if (turn.interruptPending) maybeSendInterrupt(turn);
   }
 
   // Check for immediately terminal turns
@@ -571,6 +585,7 @@ function handleTurnNotification(turn, msg) {
 
   switch (msg.method) {
     case "turn/started":
+      turn.sawTurnStarted = true;
       turn.turnId = turn.turnId || msg.params?.turn?.id;
       if (turn.interruptPending) maybeSendInterrupt(turn);
       if (turn.status === "starting") updateTurn(turn, { status: "running" });
@@ -641,22 +656,20 @@ function notifySessionWaiters(session) {
 }
 
 function waitForSessionDone(session) {
+  const call = requestContext.getStore();
   return new Promise((resolve) => {
-    const turn = turns.get(session.latestTurnId);
-    if (!turn || isTerminal(turn.status)) {
+    const finish = () => {
+      session.waiters.delete(waiter);
+      if (call?.cancelWait === finish) call.cancelWait = null;
       resolve();
-      return;
-    }
-    const waiter = () => {
-      // Only resolve when the turn is terminal — ignore intermediate state changes
-      const t = turns.get(session.latestTurnId);
-      if (!t || isTerminal(t.status)) {
-        resolve();
-      } else {
-        session.waiters.add(waiter);
-      }
     };
-    session.waiters.add(waiter);
+    const waiter = () => {
+      const turn = turns.get(session.latestTurnId);
+      if (call?.cancelled || !turn || isTerminal(turn.status)) finish();
+      else session.waiters.add(waiter);
+    };
+    if (call?.modern) call.cancelWait = finish;
+    waiter();
   });
 }
 
@@ -711,7 +724,7 @@ async function resumeThread(server, sessionId, cwd) {
   }
 }
 
-function archiveSessionAfterDelivery(
+function archiveFinishedSession(
   session,
   deliveredTurnId,
   serverOverride = null,
@@ -722,15 +735,15 @@ function archiveSessionAfterDelivery(
   }
 
   const turn = turns.get(deliveredTurnId);
-  if (
-    !turn ||
-    !isTerminal(turn.status) ||
-    !turn.resultDelivered ||
-    session.latestTurnId !== deliveredTurnId ||
-    session.activeTurnId !== null
-  ) {
-    return Promise.resolve();
+  if (!turn || !(turn.resultDelivered || turn.resultDiscarded) ||
+      session.latestTurnId !== deliveredTurnId) return Promise.resolve();
+  if (!isTerminal(turn.status)) {
+    turn.archiveAfterSettlement ||= turn.donePromise.then(() =>
+      archiveFinishedSession(session, deliveredTurnId, serverOverride),
+    );
+    return turn.archiveAfterSettlement;
   }
+  if (session.activeTurnId !== null) return Promise.resolve();
 
   session.archiveAttemptedTurnId = deliveredTurnId;
   const server = serverOverride || turn.server;
@@ -1095,7 +1108,7 @@ async function submitCodexReview(args) {
 
 async function runCodexStart(args) {
   const turn = await submitCodexStart(args);
-  if (!isTerminal(turn.status)) await turn.donePromise;
+  if (!isTerminal(turn.status)) await turn.callerDonePromise;
   if (turn.status !== "succeeded") {
     const err = new Error(turn.error?.message || `Codex ${turn.status}`);
     err.turn = turn;
@@ -1106,7 +1119,7 @@ async function runCodexStart(args) {
 
 async function runCodexResume(args) {
   const turn = await submitCodexResume(args);
-  if (!isTerminal(turn.status)) await turn.donePromise;
+  if (!isTerminal(turn.status)) await turn.callerDonePromise;
   if (turn.status !== "succeeded") {
     const err = new Error(turn.error?.message || `Codex ${turn.status}`);
     err.turn = turn;
@@ -1117,7 +1130,7 @@ async function runCodexResume(args) {
 
 async function runCodexReview(args) {
   const turn = await submitCodexReview(args);
-  if (!isTerminal(turn.status)) await turn.donePromise;
+  if (!isTerminal(turn.status)) await turn.callerDonePromise;
   if (turn.status !== "succeeded") {
     const err = new Error(turn.error?.message || `Codex ${turn.status}`);
     err.turn = turn;
@@ -1171,39 +1184,95 @@ const mcpRl = readline.createInterface({
 });
 
 mcpRl.on("line", async (line) => {
+  let message;
   try {
-    const message = JSON.parse(line);
-
-    switch (message.method) {
-      case "initialize":
-        handleInitialize(message);
-        break;
-
-      case "initialized":
-        break;
-
-      case "tools/list":
-        handleToolsList(message);
-        break;
-
-      case "tools/call":
-        await handleToolCall(message);
-        break;
-
-      default:
-        if (message.id !== undefined) {
-          sendError(message.id, -32601, "Method not found");
+    message = JSON.parse(line);
+  } catch {
+    await sendError(null, -32700, "Parse error");
+    return;
+  }
+  if (!message || Array.isArray(message) || message.jsonrpc !== "2.0" ||
+      typeof message.method !== "string") {
+    await sendError(message?.id ?? null, -32600, "Invalid Request");
+    return;
+  }
+  if (!Object.hasOwn(message, "id")) {
+    if (message.method === "notifications/cancelled") {
+      const call = liveMcpRequests.get(message.params?.requestId);
+      if (call && !call.responded && !call.cancelled) {
+        call.cancelled = true;
+        call.cancelWait?.();
+        if (call.turn) {
+          const turn = call.turn;
+          // Only a fresh start has a handle the caller never received.
+          if (turn.toolName === "codex") {
+            turn.resultDiscarded = true;
+            turn.archiveAfterSettlement = turn.donePromise.then(() =>
+              archiveFinishedSession(sessions.get(turn.sessionId), turn.id),
+            );
+          }
+          requestTurnCancel(turn);
         }
-        // Silently ignore unknown notifications (no id)
+      }
     }
-  } catch (e) {
-    console.error("Error processing message:", e);
+    return;
+  }
+  let context;
+  try {
+    context = requestProtocol(message);
+  } catch (error) {
+    await sendError(message.id, error.code, error.message, error.data);
+    return;
+  }
+  if (context.modern && liveMcpRequests.has(message.id) &&
+      !liveMcpRequests.get(message.id).cancelled &&
+      !liveMcpRequests.get(message.id).responded) {
+    await sendError(message.id, -32600, "Request id is already in flight");
+    return;
+  }
+  if (context.modern) liveMcpRequests.set(message.id, context);
+  try {
+    await requestContext.run(context, async () => {
+      switch (message.method) {
+        case "server/discover":
+          await sendResponse(message.id, discovery(INSTRUCTIONS));
+          break;
+        case "initialize":
+          if (context.modern) {
+            await sendError(message.id, -32601, "Use server/discover instead of initialize");
+          } else {
+            await handleInitialize(message);
+          }
+          break;
+        case "ping":
+          if (context.modern) {
+            await sendError(message.id, -32601, "Method not found");
+          } else {
+            await sendResponse(message.id, {});
+          }
+          break;
+        case "tools/list":
+          await handleToolsList(message);
+          break;
+        case "tools/call":
+          await handleToolCall(message);
+          break;
+        default:
+          await sendError(message.id, -32601, "Method not found");
+      }
+    });
+  } catch (error) {
+    await requestContext.run(context, () => sendError(message.id, -32603, error.message));
+  } finally {
+    if (liveMcpRequests.get(message.id) === context) liveMcpRequests.delete(message.id);
   }
 });
 
+const INSTRUCTIONS = "Read the `collaborating-with-codex` skill before using these tools. Codex is an external AI agent for second opinions, planning, and code review — form your own analysis first to avoid anchoring bias. `codex` defaults to read-only; `writable: true` allows file writes and commands and must be explicitly scoped in the prompt. `async: true` on `codex`, `codex-reply`, and `codex-review` returns a sessionId immediately instead of blocking; poll with `codex-result` (use `wait: true` to block until done) and stop with `codex-cancel`. Session IDs work across `codex-reply`, `codex-result`, and `codex-cancel`.";
+
 function handleInitialize(message) {
-  sendResponse(message.id, {
-    protocolVersion: "2024-11-05",
+  return sendResponse(message.id, {
+    protocolVersion: LEGACY_VERSION,
     capabilities: {
       tools: {},
     },
@@ -1211,13 +1280,13 @@ function handleInitialize(message) {
       name: "codex-mcp",
       version: VERSION,
     },
-    instructions:
-      "Read the `collaborating-with-codex` skill before using these tools. Codex is an external AI agent for second opinions, planning, and code review — form your own analysis first to avoid anchoring bias. `codex` defaults to read-only; `writable: true` allows file writes and commands and must be explicitly scoped in the prompt. `async: true` on `codex`, `codex-reply`, and `codex-review` returns a sessionId immediately instead of blocking; poll with `codex-result` (use `wait: true` to block until done) and stop with `codex-cancel`. Session IDs work across `codex-reply`, `codex-result`, and `codex-cancel`.",
+    instructions: INSTRUCTIONS,
   });
 }
 
 function handleToolsList(message) {
-  sendResponse(message.id, {
+  return sendResponse(message.id, {
+    ...(requestContext.getStore()?.modern ? CATALOG_CACHE : {}),
     tools: [
       {
         name: "codex",
@@ -1362,12 +1431,12 @@ async function handleToolCall(message) {
           : session
             ? snapshotSession(session)
             : snapshotFallback(turn);
-      await sendResponse(message.id, {
+      if (!(await sendResponse(message.id, {
         content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
-      });
+      }))) return;
       if (turn.archiveAfterDeliveryTurnId) {
         const previousSession = sessions.get(turn.sessionId);
-        await archiveSessionAfterDelivery(
+        await archiveFinishedSession(
           previousSession,
           turn.archiveAfterDeliveryTurnId,
           turn.archiveAfterDeliveryServer,
@@ -1379,22 +1448,22 @@ async function handleToolCall(message) {
     // --- Session tools ---
     if (name === "codex-result") {
       const { snapshot, session, turnId } = await runCodexResult(args);
-      await sendResponse(message.id, {
+      if (!(await sendResponse(message.id, {
         content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
-      });
+      }))) return;
       if (snapshot.done) {
         const deliveredTurn = turns.get(turnId);
         if (deliveredTurn) deliveredTurn.resultDelivered = true;
-        await archiveSessionAfterDelivery(session, turnId);
+        await archiveFinishedSession(session, turnId);
       }
       return;
     }
 
     if (name === "codex-cancel") {
       const snapshot = runCodexCancel(args);
-      await sendResponse(message.id, {
+      if (!(await sendResponse(message.id, {
         content: [{ type: "text", text: JSON.stringify(snapshot, null, 2) }],
-      });
+      }))) return;
       return;
     }
 
@@ -1419,16 +1488,16 @@ async function handleToolCall(message) {
       });
     }
 
-    await sendResponse(message.id, { content });
+    if (!(await sendResponse(message.id, { content }))) return;
     result.turn.resultDelivered = true;
     const session = sessions.get(result.sessionId);
-    await archiveSessionAfterDelivery(session, result.turn.id);
+    await archiveFinishedSession(session, result.turn.id);
   } catch (e) {
-    await sendError(message.id, -32603, e.message);
+    if (!(await sendError(message.id, -32603, e.message))) return;
     if (e.turn) e.turn.resultDelivered = true;
     if (e.turn?.sessionId) {
       const session = sessions.get(e.turn.sessionId);
-      await archiveSessionAfterDelivery(
+      await archiveFinishedSession(
         session,
         e.turn.archiveAfterDeliveryTurnId || e.turn.id,
         e.turn.archiveAfterDeliveryServer,
@@ -1462,20 +1531,27 @@ function snapshotFallback(turn) {
 // ---------------------------------------------------------------------------
 
 function sendResponse(id, result) {
+  const context = requestContext.getStore();
+  if (context?.cancelled) return Promise.resolve(false);
+  if (context) context.responded = true;
+  result = completeResult(result, context, { name: "codex-mcp", version: VERSION });
   return writeMcpMessage({ jsonrpc: "2.0", id, result });
 }
 
-function sendError(id, code, message) {
+function sendError(id, code, message, data) {
+  const context = requestContext.getStore();
+  if (context?.cancelled) return Promise.resolve(false);
+  if (context) context.responded = true;
   return writeMcpMessage({
     jsonrpc: "2.0",
     id,
-    error: { code, message },
+    error: { code, message, ...(data === undefined ? {} : { data }) },
   });
 }
 
 function writeMcpMessage(message) {
   return new Promise((resolve) => {
-    process.stdout.write(JSON.stringify(message) + "\n", resolve);
+    process.stdout.write(JSON.stringify(message) + "\n", () => resolve(true));
   });
 }
 
@@ -1489,12 +1565,12 @@ async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  // Let a just-flushed terminal response enter its post-delivery archive step,
-  // then give only those already-started archive operations time to settle.
+  // Allow delivered results and cancelled fresh starts to finish bounded cleanup.
   await new Promise((resolve) => setImmediate(resolve));
-  const pendingArchives = [...sessions.values()]
-    .map((session) => session.archivePromise)
-    .filter(Boolean);
+  const pendingArchives = [
+    ...[...sessions.values()].map((session) => session.archivePromise),
+    ...[...turns.values()].map((turn) => turn.archiveAfterSettlement),
+  ].filter(Boolean);
   if (pendingArchives.length > 0) {
     await Promise.race([
       Promise.allSettled(pendingArchives),
