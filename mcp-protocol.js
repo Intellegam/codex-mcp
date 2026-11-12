@@ -11,8 +11,8 @@ function object(value) {
 function requestProtocol(message) {
   const meta = message.params?._meta;
   const modern = message.method === "server/discover" ||
-    (object(meta) && (Object.hasOwn(meta, PREFIX + "protocolVersion") ||
-      Object.hasOwn(meta, PREFIX + "clientCapabilities")));
+    (object(meta) && ["protocolVersion", "clientCapabilities", "clientInfo", "logLevel"]
+      .some((name) => Object.hasOwn(meta, PREFIX + name)));
   if (!modern) return { modern: false };
   const invalid = (text) => { throw Object.assign(new Error(text), { code: -32602 }); };
   if ((typeof message.id !== "string" && !Number.isSafeInteger(message.id)) ||

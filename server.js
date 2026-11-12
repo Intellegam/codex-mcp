@@ -26,7 +26,10 @@ const TIMEOUT_MS =
   parseInt(process.env.CODEX_TIMEOUT_MS, 10) || 30 * 60 * 1000;
 const REQUEST_TIMEOUT_MS =
   parseInt(process.env.CODEX_REQUEST_TIMEOUT_MS, 10) || 5_000;
-const CANCEL_WATCHDOG_MS = 30_000;
+const cancelWatchdogSetting = Number(process.env.CODEX_CANCEL_WATCHDOG_MS);
+const CANCEL_WATCHDOG_MS = Number.isSafeInteger(cancelWatchdogSetting) &&
+  cancelWatchdogSetting > 0 && cancelWatchdogSetting <= 2_147_483_647
+  ? cancelWatchdogSetting : 30_000;
 const CLAUDE_MCP_OVERRIDE =
   'mcp_servers.claude-agent={command="false",enabled=false}';
 
@@ -299,6 +302,8 @@ function createTurn({ toolName, cwd, timeoutMs }) {
   const donePromise = new Promise((resolve) => {
     resolveDone = resolve;
   });
+  let resolveCallerDone;
+  const callerDonePromise = new Promise((resolve) => { resolveCallerDone = resolve; });
   const turn = {
     id,
     toolName,
@@ -319,7 +324,7 @@ function createTurn({ toolName, cwd, timeoutMs }) {
     error: null,
     resultDelivered: false,
     resultDiscarded: false,
-    discardPromise: null,
+    archiveAfterSettlement: null,
     cancelRequested: false,
     cancelReason: null,
     interruptPending: false,
@@ -331,6 +336,8 @@ function createTurn({ toolName, cwd, timeoutMs }) {
     archiveAfterDeliveryServer: null,
     donePromise,
     resolveDone,
+    callerDonePromise,
+    resolveCallerDone,
     cleanup: null,
   };
   const call = requestContext.getStore();
@@ -376,6 +383,7 @@ function settleTurn(turn, status, patch = {}) {
   }
 
   turn.resolveDone(turn);
+  turn.resolveCallerDone(turn);
 }
 
 function failTurn(turn, err, source) {
@@ -481,18 +489,15 @@ function requestTurnCancel(turn, reason = "user") {
   if (!turn.cancelRequested) {
     turn.cancelRequested = true;
     turn.cancelReason = reason;
-    // Bound cancellation even while waiting for turn/started.
     turn.cancelWatchdog = setTimeout(() => {
-      if (!isTerminal(turn.status)) {
-        const terminalStatus =
-          turn.cancelReason === "timeout" ? "timed_out" : "cancelled";
-        settleTurn(turn, terminalStatus, {
-          error: {
-            message: `Codex cancellation did not settle within ${CANCEL_WATCHDOG_MS / 1000}s`,
-            source: turn.cancelReason === "timeout" ? "timeout" : "cancel",
-          },
-        });
-      }
+      if (isTerminal(turn.status)) return;
+      // A caller timeout is not proof that the backend released the thread.
+      updateTurn(turn, { error: {
+        message: `Codex cancellation is still pending after ${CANCEL_WATCHDOG_MS / 1000}s; awaiting backend settlement`,
+        source: turn.cancelReason === "timeout" ? "timeout" : "cancel",
+      } });
+      console.error(`[codex-mcp] ${turn.error.message} (turn ${turn.id})`);
+      turn.resolveCallerDone(turn);
     }, CANCEL_WATCHDOG_MS);
     turn.cancelWatchdog.unref?.();
   }
@@ -730,15 +735,15 @@ function archiveFinishedSession(
   }
 
   const turn = turns.get(deliveredTurnId);
-  if (
-    !turn ||
-    !isTerminal(turn.status) ||
-    !(turn.resultDelivered || turn.resultDiscarded) ||
-    session.latestTurnId !== deliveredTurnId ||
-    session.activeTurnId !== null
-  ) {
-    return Promise.resolve();
+  if (!turn || !(turn.resultDelivered || turn.resultDiscarded) ||
+      session.latestTurnId !== deliveredTurnId) return Promise.resolve();
+  if (!isTerminal(turn.status)) {
+    turn.archiveAfterSettlement ||= turn.donePromise.then(() =>
+      archiveFinishedSession(session, deliveredTurnId, serverOverride),
+    );
+    return turn.archiveAfterSettlement;
   }
+  if (session.activeTurnId !== null) return Promise.resolve();
 
   session.archiveAttemptedTurnId = deliveredTurnId;
   const server = serverOverride || turn.server;
@@ -1103,7 +1108,7 @@ async function submitCodexReview(args) {
 
 async function runCodexStart(args) {
   const turn = await submitCodexStart(args);
-  if (!isTerminal(turn.status)) await turn.donePromise;
+  if (!isTerminal(turn.status)) await turn.callerDonePromise;
   if (turn.status !== "succeeded") {
     const err = new Error(turn.error?.message || `Codex ${turn.status}`);
     err.turn = turn;
@@ -1114,7 +1119,7 @@ async function runCodexStart(args) {
 
 async function runCodexResume(args) {
   const turn = await submitCodexResume(args);
-  if (!isTerminal(turn.status)) await turn.donePromise;
+  if (!isTerminal(turn.status)) await turn.callerDonePromise;
   if (turn.status !== "succeeded") {
     const err = new Error(turn.error?.message || `Codex ${turn.status}`);
     err.turn = turn;
@@ -1125,7 +1130,7 @@ async function runCodexResume(args) {
 
 async function runCodexReview(args) {
   const turn = await submitCodexReview(args);
-  if (!isTerminal(turn.status)) await turn.donePromise;
+  if (!isTerminal(turn.status)) await turn.callerDonePromise;
   if (turn.status !== "succeeded") {
     const err = new Error(turn.error?.message || `Codex ${turn.status}`);
     err.turn = turn;
@@ -1202,7 +1207,7 @@ mcpRl.on("line", async (line) => {
           // Only a fresh start has a handle the caller never received.
           if (turn.toolName === "codex") {
             turn.resultDiscarded = true;
-            turn.discardPromise = turn.donePromise.then(() =>
+            turn.archiveAfterSettlement = turn.donePromise.then(() =>
               archiveFinishedSession(sessions.get(turn.sessionId), turn.id),
             );
           }
@@ -1240,7 +1245,11 @@ mcpRl.on("line", async (line) => {
           }
           break;
         case "ping":
-          await sendResponse(message.id, {});
+          if (context.modern) {
+            await sendError(message.id, -32601, "Method not found");
+          } else {
+            await sendResponse(message.id, {});
+          }
           break;
         case "tools/list":
           await handleToolsList(message);
@@ -1560,7 +1569,7 @@ async function shutdown() {
   await new Promise((resolve) => setImmediate(resolve));
   const pendingArchives = [
     ...[...sessions.values()].map((session) => session.archivePromise),
-    ...[...turns.values()].map((turn) => turn.discardPromise),
+    ...[...turns.values()].map((turn) => turn.archiveAfterSettlement),
   ].filter(Boolean);
   if (pendingArchives.length > 0) {
     await Promise.race([

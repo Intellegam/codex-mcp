@@ -230,6 +230,7 @@ This works for any combination of `codex`, `codex-reply`, and `codex-review` —
 | Environment Variable        | Default            | Description                                             |
 | --------------------------- | ------------------ | ------------------------------------------------------- |
 | `CODEX_TIMEOUT_MS`          | `1800000` (30 min) | Maximum time to wait for a Codex turn to complete       |
+| `CODEX_CANCEL_WATCHDOG_MS` | `30000` (30 sec) | After cancellation, release a synchronous caller with an error if backend settlement is still pending |
 | `CODEX_REQUEST_TIMEOUT_MS`  | `5000` (5 sec)     | Maximum time to wait for an app-server request response |
 
 ## Architecture
@@ -240,10 +241,11 @@ Uses the Codex app-server JSON-RPC protocol instead of CLI subprocess calls:
 - **Bridge isolation**: Each child app-server disables the exact `claude-agent` MCP server identity to prevent recursive Claude → Codex → Claude bridge calls without changing the operator's normal Codex configuration. Alternate Claude bridge aliases are not covered.
 - **Formal protocol**: Bidirectional JSON-RPC 2.0 with typed requests/responses and streaming notifications
 - **Async-first engine**: Turns tracked in an in-memory Map with state machine and thread guards. Sync tools are thin wrappers that await completion
-- **Timeout protection**: Configurable timeouts with `turn/interrupt` on expiry and a 30s cancel watchdog to prevent ghost turns
+- **Timeout protection**: Configurable timeouts with `turn/interrupt` on expiry and a 30s cancel watchdog that bounds the caller wait while retaining backend tracking and thread guards until actual completion
 - **Clean shutdown**: On SIGINT, SIGTERM, or stdin close, already-started
-  post-delivery archival gets a bounded chance to settle before the app server
-  is terminated
+  post-delivery or discarded-session archival gets a bounded chance to settle
+  before the app server is terminated. Forced shutdown cannot guarantee archival
+  of a backend turn that has not stopped within that grace period
 - **Session resume**: Non-ephemeral threads are persisted by Codex. Archived
   threads are automatically unarchived when either `thread/resume` or
   `turn/start` reports archived state, using `threadId` + `cwd` when a fresh

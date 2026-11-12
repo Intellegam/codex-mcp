@@ -1115,6 +1115,19 @@ describe("MCP 2026-07-28", () => {
     server.send({ jsonrpc: "2.0", id, method, params: { ...params, _meta: metadata } });
   }
 
+  test("ping is rejected for modern requests and retained for legacy clients", async () => {
+    server = spawnServer();
+    send(1, "ping");
+    const modern = await server.waitResponse();
+    expect(modern.error.code).toBe(-32601);
+    expect(modern.result).toBeUndefined();
+    await server.mcpInit();
+    server.send({ jsonrpc: "2.0", id: 2, method: "ping", params: {} });
+    expect((await server.waitResponse()).result).toEqual({});
+    send(3, "ping");
+    expect((await server.waitResponse()).error.code).toBe(-32601);
+  });
+
   test("discovery and catalog need no initialize or agent process", async () => {
     server = spawnServer();
     send(1, "server/discover");
@@ -1152,8 +1165,20 @@ describe("MCP 2026-07-28", () => {
         supported: ["2026-07-28"], requested: "2099-01-01",
       });
     }
-    send(++id, "ping");
+    send(++id, "tools/list");
     expect((await server.waitResponse()).result.resultType).toBe("complete");
+    expect(server.getMockEvents()).toEqual([]);
+  });
+
+  test("modern-only metadata cannot bypass required envelope validation", async () => {
+    server = spawnServer();
+    let id = 0;
+    for (const key of ["clientInfo", "logLevel"]) {
+      send(++id, "tools/list", {}, { ["io.modelcontextprotocol/" + key]: {} });
+      expect((await server.waitResponse()).error.code).toBe(-32602);
+    }
+    send(++id, "tools/list", {}, { "vendor.example/trace": "legacy" });
+    expect((await server.waitResponse()).result.resultType).toBeUndefined();
     expect(server.getMockEvents()).toEqual([]);
   });
 
@@ -1171,7 +1196,7 @@ describe("MCP 2026-07-28", () => {
     const init = await server.mcpInit();
     expect(init.result.protocolVersion).toBe("2024-11-05");
     expect(init.result.resultType).toBeUndefined();
-    send(3, "ping");
+    send(3, "tools/list");
     expect((await server.waitResponse()).result.resultType).toBe("complete");
   });
 
@@ -1194,13 +1219,13 @@ describe("MCP 2026-07-28", () => {
     send(1, "tools/call", { name: "codex", arguments: { prompt: "cancel me" } });
     await waitForMockMethod(server, "turn/start");
     server.send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } });
-    send(1, "ping");
+    send(1, "tools/list");
     const reused = await server.waitResponse();
     expect(reused.id).toBe(1);
     expect(reused.result.resultType).toBe("complete");
     await waitForMockMethod(server, "turn/interrupt");
-    await new Promise((resolve) => setTimeout(resolve, 600));
-    send(2, "ping");
+    await waitForMockMethod(server, "thread/archive");
+    send(2, "tools/list");
     expect((await server.waitResponse()).id).toBe(2);
     const archives = server.getMockEvents().filter((e) => e.method === "thread/archive");
     expect(archives.length).toBe(1);
@@ -1218,7 +1243,7 @@ describe("MCP 2026-07-28", () => {
       } },
       { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } },
       { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } },
-      { jsonrpc: "2.0", id: 2, method: "ping", params: { _meta: meta() } },
+      { jsonrpc: "2.0", id: 2, method: "tools/list", params: { _meta: meta() } },
     ].map((message) => JSON.stringify(message)).join("\n") + "\n");
     expect((await server.waitResponse()).id).toBe(2);
     await waitForMockMethod(server, "thread/archive");
@@ -1227,7 +1252,7 @@ describe("MCP 2026-07-28", () => {
     expect(eventOrder.findIndex((e) => e.method === "turn/interrupt")).toBeGreaterThan(
       eventOrder.findIndex((e) => e.method === "mock/turn-ready"),
     );
-    send(3, "ping");
+    send(3, "tools/list");
     expect((await server.waitResponse()).id).toBe(3);
     expect(server.getMockEvents().filter((event) => event.method === "thread/archive").length).toBe(1);
   });
@@ -1241,7 +1266,7 @@ describe("MCP 2026-07-28", () => {
         name: "codex-result", arguments: { sessionId, wait: true }, _meta: meta(),
       } },
       { jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 2 } },
-      { jsonrpc: "2.0", id: 3, method: "ping", params: { _meta: meta() } },
+      { jsonrpc: "2.0", id: 3, method: "tools/list", params: { _meta: meta() } },
     ].map((message) => JSON.stringify(message)).join("\n") + "\n");
     expect((await server.waitResponse()).id).toBe(3);
     expect(server.getMockEvents().some((event) => event.method === "turn/interrupt")).toBe(false);
@@ -1264,7 +1289,8 @@ describe("MCP 2026-07-28", () => {
       "reply did not start");
     server.send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 3 } });
     await waitForMockMethod(server, "turn/interrupt");
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await waitForCondition(() => server.getMockEvents().filter((e) => e.method === "mock/turn-completed").length === 2,
+      "cancelled reply did not complete");
     expect(server.getMockEvents().filter((e) => e.method === "thread/archive").length).toBe(1);
     send(4, "tools/call", { name: "codex-result", arguments: { sessionId, wait: true } });
     const response = await server.waitResponse();
@@ -1281,11 +1307,62 @@ describe("MCP 2026-07-28", () => {
     await waitForMockMethod(server, "review/start");
     server.send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } });
     await waitForMockMethod(server, "turn/interrupt");
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    send(2, "ping");
+    await waitForMockMethod(server, "mock/turn-completed");
+    send(2, "tools/list");
     expect((await server.waitResponse()).id).toBe(2);
     expect(server.getMockEvents().some((e) => e.method === "thread/archive")).toBe(false);
     expect(server.getMockEvents().some((e) => e.method === "mock/early-interrupt-rejected")).toBe(false);
+  });
+
+  test("watchdog preserves a cancelled fresh turn until late readiness and completion", async () => {
+    const gateDir = fs.mkdtempSync(path.join(mockArtifactDir, "gates-"));
+    server = spawnServer({ CODEX_CANCEL_WATCHDOG_MS: "40", MOCK_TURN_GATE_DIR: gateDir,
+      MOCK_IGNORE_INTERRUPT: "1" });
+    send(1, "tools/call", { name: "codex", arguments: { prompt: "late cancellation" } });
+    await waitForMockMethod(server, "turn/start");
+    server.send({ jsonrpc: "2.0", method: "notifications/cancelled", params: { requestId: 1 } });
+    await waitForCondition(() => server.getStderr().includes("awaiting backend settlement"), "watchdog never fired");
+    expect(server.getMockEvents().some((e) => e.method === "thread/archive")).toBe(false);
+    fs.writeFileSync(path.join(gateDir, "ready"), "");
+    await waitForMockMethod(server, "turn/interrupt");
+    expect(server.getMockEvents().some((e) => e.method === "mock/early-interrupt-rejected")).toBe(false);
+    expect(server.getMockEvents().some((e) => e.method === "thread/archive")).toBe(false);
+    fs.writeFileSync(path.join(gateDir, "complete"), "");
+    await waitForMockMethod(server, "thread/archive");
+    const events = server.getMockEvents();
+    expect(events.findIndex((e) => e.method === "thread/archive")).toBeGreaterThan(
+      events.findIndex((e) => e.method === "mock/turn-completed"));
+    send(2, "tools/list");
+    expect((await server.waitResponse()).id).toBe(2);
+    expect(events.filter((e) => e.method === "thread/archive").length).toBe(1);
+  });
+
+  test("watchdog bounds the caller while retaining the active-thread guard", async () => {
+    const gateDir = fs.mkdtempSync(path.join(mockArtifactDir, "gates-"));
+    server = spawnServer({ CODEX_TIMEOUT_MS: "30", CODEX_CANCEL_WATCHDOG_MS: "40",
+      MOCK_TURN_GATE_DIR: gateDir, MOCK_IGNORE_INTERRUPT: "1" });
+    send(1, "tools/call", { name: "codex", arguments: { prompt: "wait for backend" } });
+    const response = await server.waitResponse();
+    expect(response.id).toBe(1);
+    expect(response.error.message).toContain("awaiting backend settlement");
+    const sessionId = server.getMockEvents().find((e) => e.method === "turn/start").params.threadId;
+    send(2, "tools/call", { name: "codex-result", arguments: { sessionId } });
+    const pending = JSON.parse((await server.waitResponse()).result.content[0].text);
+    expect(pending.status).toBe("cancelling");
+    expect(pending.done).toBe(false);
+    send(3, "tools/call", { name: "codex-reply", arguments: { sessionId, prompt: "cannot overlap" } });
+    expect((await server.waitResponse()).error.message).toContain("active turn");
+    expect(server.getMockEvents().some((e) => e.method === "thread/archive")).toBe(false);
+    // Other threads remain usable while the timed-out thread is guarded.
+    send(4, "tools/call", { name: "codex", arguments: { prompt: "independent", async: true } });
+    const other = JSON.parse((await server.waitResponse()).result.content[0].text);
+    expect(other.sessionId).not.toBe(sessionId);
+    fs.writeFileSync(path.join(gateDir, "ready"), "");
+    await waitForMockMethod(server, "turn/interrupt");
+    fs.writeFileSync(path.join(gateDir, "complete"), "");
+    await waitForMockMethod(server, "thread/archive");
+    send(5, "tools/call", { name: "codex-result", arguments: { sessionId } });
+    expect(JSON.parse((await server.waitResponse()).result.content[0].text).done).toBe(true);
   });
 
   test("shutdown grants cancelled fresh startup time to archive", async () => {
