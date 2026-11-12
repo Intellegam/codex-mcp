@@ -8,6 +8,32 @@ function object(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function optional(value, key, valid) {
+  return !Object.hasOwn(value, key) || valid(value[key]);
+}
+
+const string = (value) => typeof value === "string";
+const stringArray = (value) => Array.isArray(value) && value.every(string);
+function icon(value) {
+  return object(value) && string(value.src) &&
+    optional(value, "mimeType", string) && optional(value, "sizes", stringArray) &&
+    optional(value, "theme", (theme) => theme === "light" || theme === "dark");
+}
+function implementation(value) {
+  return object(value) && string(value.name) && string(value.version) &&
+    ["title", "description", "websiteUrl"].every((key) => optional(value, key, string)) &&
+    optional(value, "icons", (icons) => Array.isArray(icons) && icons.every(icon));
+}
+function capabilities(value) {
+  const objectValues = (record) => object(record) && Object.values(record).every(object);
+  return object(value) && optional(value, "roots", object) &&
+    ["experimental", "extensions"].every((key) => optional(value, key, objectValues)) &&
+    optional(value, "sampling", (sampling) => object(sampling) &&
+      ["context", "tools"].every((key) => optional(sampling, key, object))) &&
+    optional(value, "elicitation", (elicitation) => object(elicitation) &&
+      ["form", "url"].every((key) => optional(elicitation, key, object)));
+}
+
 function requestProtocol(message) {
   const meta = message.params?._meta;
   const modern = message.method === "server/discover" ||
@@ -27,8 +53,20 @@ function requestProtocol(message) {
       data: { supported: [MODERN_VERSION], requested: version },
     });
   }
-  if (!object(meta[PREFIX + "clientCapabilities"])) {
+  if (!capabilities(meta[PREFIX + "clientCapabilities"])) {
     invalid("Missing or invalid clientCapabilities metadata");
+  }
+  // Validate optional fields when present, without interpreting self-reported identity.
+  if (!optional(meta, PREFIX + "clientInfo", implementation)) {
+    invalid("Invalid clientInfo metadata");
+  }
+  if (!optional(meta, PREFIX + "logLevel", (level) =>
+    ["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"].includes(level))) {
+    invalid("Invalid logLevel metadata");
+  }
+  if (!optional(meta, "progressToken", (token) => string(token) ||
+      (typeof token === "number" && Number.isFinite(token)))) {
+    invalid("Invalid progressToken metadata");
   }
   return { modern: true };
 }
