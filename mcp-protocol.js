@@ -41,7 +41,7 @@ function requestProtocol(message) {
       .some((name) => Object.hasOwn(meta, PREFIX + name)));
   if (!modern) return { modern: false };
   const invalid = (text) => { throw Object.assign(new Error(text), { code: -32602 }); };
-  if ((typeof message.id !== "string" && !Number.isSafeInteger(message.id)) ||
+  if ((typeof message.id !== "string" && !Number.isInteger(message.id)) ||
       !object(message.params) || !object(meta)) {
     invalid("Modern requests require a string or integer id and params._meta");
   }

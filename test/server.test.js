@@ -1227,6 +1227,20 @@ describe("MCP 2026-07-28", () => {
     expect(server.getMockEvents()).toEqual([]);
   });
 
+  test("modern numeric request IDs follow the integer schema without a safe-range limit", async () => {
+    server = spawnServer();
+    for (const id of [0, -1, Number.MAX_SAFE_INTEGER + 1, 1e20]) {
+      send(id, "tools/list");
+      const response = await server.waitResponse();
+      expect(response.id).toBe(id);
+      expect(response.result.resultType).toBe("complete");
+    }
+    for (const id of [1.5, null, true]) {
+      send(id, "tools/list");
+      expect((await server.waitResponse()).error.code).toBe(-32602);
+    }
+  });
+
   test("old and new requests overlap without leaking response format", async () => {
     server = spawnServer({ MOCK_TURN_DELAY_MS: "100" });
     send(1, "tools/call", { name: "codex", arguments: { prompt: "modern" } });
