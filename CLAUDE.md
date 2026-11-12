@@ -19,7 +19,8 @@ and an async-first turn engine:
 2. Spawns a single `codex app-server` process per MCP connection
 3. Translates tool calls to app-server RPC methods (`thread/start`, `turn/start`, `review/start`)
 4. Tracks turns in an in-memory Map with state machine (`starting` → `running` → terminal)
-5. Sync tools are thin wrappers that `await turn.donePromise`
+5. Sync tools await `turn.callerDonePromise`; `turn.donePromise` tracks actual
+   backend settlement for thread guards and archival
 6. Returns results via MCP protocol with thread IDs as session IDs
 
 ## Tools Provided
