@@ -1030,7 +1030,7 @@ describe("archive failure handling", () => {
 
   test("invalidates loaded state after a live archive timeout", async () => {
     server = spawnServer({
-      CODEX_REQUEST_TIMEOUT_MS: "100",
+      CODEX_REQUEST_TIMEOUT_MS: "1000",
       MOCK_ARCHIVE_TIMEOUT_AFTER_APPLY: "1",
       MOCK_ARCHIVE_ENFORCE: "both",
     });
@@ -1133,7 +1133,7 @@ describe("MCP 2026-07-28", () => {
     send(1, "server/discover");
     const discover = (await server.waitResponse()).result;
     expect(discover.resultType).toBe("complete");
-    expect(discover.supportedVersions).toEqual(["2026-07-28"]);
+    expect(discover.supportedVersions).toEqual(["2026-07-28", "2024-11-05"]);
     expect(discover._meta["io.modelcontextprotocol/serverInfo"].name).toBe("codex-mcp");
     expect(discover.instructions).toContain("read-only");
     expect(discover.capabilities).toEqual({ tools: {} });
@@ -1162,7 +1162,7 @@ describe("MCP 2026-07-28", () => {
       const response = await server.waitResponse();
       expect(response.error.code).toBe(code);
       if (code === -32022) expect(response.error.data).toEqual({
-        supported: ["2026-07-28"], requested: "2099-01-01",
+        supported: ["2026-07-28", "2024-11-05"], requested: "2099-01-01",
       });
     }
     send(++id, "tools/list");
@@ -1227,18 +1227,33 @@ describe("MCP 2026-07-28", () => {
     expect(server.getMockEvents()).toEqual([]);
   });
 
-  test("modern numeric request IDs follow the integer schema without a safe-range limit", async () => {
+  test("modern request IDs preserve safe integers and unrestricted strings", async () => {
     server = spawnServer();
-    for (const id of [0, -1, Number.MAX_SAFE_INTEGER + 1, 1e20]) {
+    for (const id of [0, -1, Number.MAX_SAFE_INTEGER, -Number.MAX_SAFE_INTEGER, "9007199254740993"]) {
       send(id, "tools/list");
       const response = await server.waitResponse();
       expect(response.id).toBe(id);
       expect(response.result.resultType).toBe("complete");
     }
-    for (const id of [1.5, null, true]) {
+    for (const id of [null, true]) {
       send(id, "tools/list");
       expect((await server.waitResponse()).error.code).toBe(-32602);
     }
+  });
+
+  test("raw unsafe numeric IDs cannot start agent work or echo rounded values", async () => {
+    server = spawnServer();
+    for (const rawId of ["9007199254740992", "9007199254740993", "-9007199254740993", "1e20", "1e309", "1.5"]) {
+      const line = JSON.stringify({ jsonrpc: "2.0", id: "RAW_ID", method: "tools/call",
+        params: { _meta: meta(), name: "codex", arguments: { prompt: "must not run" } } });
+      server.proc.stdin.write(line.replace('"RAW_ID"', rawId) + "\n");
+      const response = await server.waitResponse();
+      expect(response.id).toBeNull();
+      expect(response.error.code).toBe(-32600);
+    }
+    send("9007199254740993", "tools/list");
+    expect((await server.waitResponse()).id).toBe("9007199254740993");
+    expect(server.getMockEvents()).toEqual([]);
   });
 
   test("old and new requests overlap without leaking response format", async () => {

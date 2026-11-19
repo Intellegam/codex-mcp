@@ -1221,7 +1221,7 @@ mcpRl.on("line", async (line) => {
   try {
     context = requestProtocol(message);
   } catch (error) {
-    await sendError(message.id, error.code, error.message, error.data);
+    await sendError(error.responseId === null ? null : message.id, error.code, error.message, error.data);
     return;
   }
   if (context.modern && liveMcpRequests.has(message.id) &&

@@ -20,6 +20,9 @@ Modern clients use `server/discover` and per-request version/capability metadata
 no MCP initialization handshake is needed. Discovery and the deterministic tool
 catalog carry five-minute public cache hints. Tool arguments, session handles,
 permissions and async behavior are the same on both paths.
+Modern numeric request IDs must be safe integers; use string IDs for larger
+values. Unsafe numeric IDs are rejected with `-32600` and a null response ID,
+because their original value may have been rounded during JSON parsing.
 
 Stdio uses local server and agent processes; running turns and polling snapshots
 remain process-local. This protocol change provides no restart durability or

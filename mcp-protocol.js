@@ -1,6 +1,7 @@
 // MCP 2026-07-28 is request-scoped; legacy clients retain their initialize path.
 const MODERN_VERSION = "2026-07-28";
 const LEGACY_VERSION = "2024-11-05";
+const SUPPORTED_VERSIONS = [MODERN_VERSION, LEGACY_VERSION];
 const PREFIX = "io.modelcontextprotocol/";
 const CATALOG_CACHE = { ttlMs: 300_000, cacheScope: "public" };
 
@@ -40,6 +41,12 @@ function requestProtocol(message) {
     (object(meta) && ["protocolVersion", "clientCapabilities", "clientInfo", "logLevel"]
       .some((name) => Object.hasOwn(meta, PREFIX + name)));
   if (!modern) return { modern: false };
+  // JSON.parse can round out-of-range integers; reject them before registration.
+  if (typeof message.id === "number" && !Number.isSafeInteger(message.id)) {
+    throw Object.assign(new Error("Use a safe integer or string request id"), {
+      code: -32600, responseId: null,
+    });
+  }
   const invalid = (text) => { throw Object.assign(new Error(text), { code: -32602 }); };
   if ((typeof message.id !== "string" && !Number.isInteger(message.id)) ||
       !object(message.params) || !object(meta)) {
@@ -50,7 +57,7 @@ function requestProtocol(message) {
   if (version !== MODERN_VERSION) {
     throw Object.assign(new Error("Unsupported protocol version"), {
       code: -32022,
-      data: { supported: [MODERN_VERSION], requested: version },
+      data: { supported: SUPPORTED_VERSIONS, requested: version },
     });
   }
   if (!capabilities(meta[PREFIX + "clientCapabilities"])) {
@@ -82,7 +89,7 @@ function completeResult(result, context, serverInfo) {
 
 function discovery(instructions) {
   return {
-    supportedVersions: [MODERN_VERSION],
+    supportedVersions: SUPPORTED_VERSIONS,
     capabilities: { tools: {} },
     instructions,
     ...CATALOG_CACHE,
