@@ -18,10 +18,11 @@ const path = require("path");
 const readline = require("readline");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const { LEGACY_VERSION, CATALOG_CACHE, requestProtocol, completeResult, discovery } = require("./mcp-protocol.js");
+const { selectModel, MODEL_SCHEMA } = require("./model-selection.js");
 const requestContext = new AsyncLocalStorage();
 const liveMcpRequests = new Map();
 
-const VERSION = "3.3.0";
+const VERSION = "3.4.0";
 const TIMEOUT_MS =
   parseInt(process.env.CODEX_TIMEOUT_MS, 10) || 30 * 60 * 1000;
 const REQUEST_TIMEOUT_MS =
@@ -704,10 +705,11 @@ function isArchivedThreadError(err) {
   return /\bis archived\b|unarchive.+first/i.test(err?.message || "");
 }
 
-async function resumeThread(server, sessionId, cwd) {
+async function resumeThread(server, sessionId, cwd, model) {
   const params = {
     threadId: sessionId,
     cwd,
+    ...(model === undefined ? {} : { model }),
     approvalPolicy: "never",
   };
   try {
@@ -799,6 +801,9 @@ function archiveFinishedSession(
 async function submitCodexStart(args) {
   const cwd = path.resolve(args.cwd || process.cwd());
   const turn = createTurn({ toolName: "codex", cwd, timeoutMs: TIMEOUT_MS });
+  let model;
+  try { model = selectModel(args.model); }
+  catch (err) { failTurn(turn, err, "setup"); return turn; }
 
   let server;
   try {
@@ -813,12 +818,14 @@ async function submitCodexStart(args) {
     sandbox: args.writable ? "workspace-write" : "read-only",
     approvalPolicy: "never",
     ephemeral: false,
+    ...(model === undefined ? {} : { model }),
   };
 
   let thread;
+  let effectiveModel;
   server.setupCount++;
   try {
-    ({ thread } = await server.request("thread/start", threadStartParams));
+    ({ thread, model: effectiveModel } = await server.request("thread/start", threadStartParams));
   } catch (err) {
     server.setupCount--;
     if (!retryableServerClose(server)) {
@@ -832,7 +839,7 @@ async function submitCodexStart(args) {
     }
     server.setupCount++;
     try {
-      ({ thread } = await server.request("thread/start", threadStartParams));
+      ({ thread, model: effectiveModel } = await server.request("thread/start", threadStartParams));
     } catch (retryErr) {
       server.setupCount--;
       failTurn(turn, retryErr, "setup");
@@ -847,6 +854,7 @@ async function submitCodexStart(args) {
 
   // Create session and attach turn synchronously before any async work
   const session = getOrCreateSession(thread.id, cwd, true);
+  session.model = effectiveModel ?? model;
   attachTurnToSession(session, turn);
 
   try {
@@ -875,10 +883,14 @@ async function submitCodexResume(args) {
     cwd,
     timeoutMs: TIMEOUT_MS,
   });
+  let model;
+  try { model = selectModel(args.model, false); }
+  catch (err) { failTurn(turn, err, "setup"); return turn; }
   turn.threadId = sessionId;
   turn.sessionId = sessionId;
 
   const existingSession = sessions.get(sessionId);
+  if (args.model === undefined) model = existingSession?.model;
 
   // Claim before any awaited setup so a concurrent reply cannot race through
   // resume while the previously delivered turn begins post-response archival.
@@ -940,7 +952,8 @@ async function submitCodexResume(args) {
   if (!server.loadedThreads.has(sessionId)) {
     server.setupCount++;
     try {
-      await resumeThread(server, sessionId, cwd);
+      const resumed = await resumeThread(server, sessionId, cwd, model);
+      model ??= resumed.model;
     } catch (err) {
       threadUnarchivedDuringSetup ||= err.threadUnarchived === true;
       server.setupCount--;
@@ -953,7 +966,8 @@ async function submitCodexResume(args) {
       }
       server.setupCount++;
       try {
-        await resumeThread(server, sessionId, cwd);
+        const resumed = await resumeThread(server, sessionId, cwd, model);
+        model ??= resumed.model;
       } catch (retryErr) {
         threadUnarchivedDuringSetup ||=
           retryErr.threadUnarchived === true;
@@ -979,6 +993,10 @@ async function submitCodexResume(args) {
     server.request("turn/start", {
       threadId: sessionId,
       input: [{ type: "text", text: prompt }],
+      ...(model === undefined ? {} : { model }),
+    }).then((response) => {
+      if (model !== undefined) session.model = model;
+      return response;
     });
 
   runTurnCapture(turn, server, sessionId, async () => {
@@ -1009,7 +1027,9 @@ async function submitCodexReview(args) {
 
   // Validate review args before creating any threads
   let target;
+  let model;
   try {
+    model = selectModel(args.model);
     switch (args.mode) {
       case "uncommitted":
         target = { type: "uncommittedChanges" };
@@ -1048,12 +1068,14 @@ async function submitCodexReview(args) {
     sandbox: "read-only",
     approvalPolicy: "never",
     ephemeral: true,
+    ...(model === undefined ? {} : { model, config: { review_model: model } }),
   };
 
   let thread;
+  let effectiveModel;
   server.setupCount++;
   try {
-    ({ thread } = await server.request("thread/start", threadStartParams));
+    ({ thread, model: effectiveModel } = await server.request("thread/start", threadStartParams));
   } catch (err) {
     server.setupCount--;
     if (!retryableServerClose(server)) {
@@ -1067,7 +1089,7 @@ async function submitCodexReview(args) {
     }
     server.setupCount++;
     try {
-      ({ thread } = await server.request("thread/start", threadStartParams));
+      ({ thread, model: effectiveModel } = await server.request("thread/start", threadStartParams));
     } catch (retryErr) {
       server.setupCount--;
       failTurn(turn, retryErr, "setup");
@@ -1082,6 +1104,7 @@ async function submitCodexReview(args) {
 
   // Create session and attach turn synchronously
   const session = getOrCreateSession(thread.id, cwd, false);
+  session.model = effectiveModel ?? model;
   attachTurnToSession(session, turn);
 
   try {
@@ -1296,6 +1319,7 @@ function handleToolsList(message) {
           properties: {
             prompt: { type: "string", description: "The prompt for Codex" },
             cwd: { type: "string", description: "Working directory" },
+            model: MODEL_SCHEMA,
             writable: {
               type: "boolean",
               description:
@@ -1316,6 +1340,7 @@ function handleToolsList(message) {
           type: "object",
           properties: {
             sessionId: { type: "string", description: "Codex session ID" },
+            model: MODEL_SCHEMA,
             prompt: { type: "string", description: "Follow-up prompt" },
             cwd: {
               type: "string",
@@ -1337,6 +1362,7 @@ function handleToolsList(message) {
         inputSchema: {
           type: "object",
           properties: {
+            model: MODEL_SCHEMA,
             mode: {
               type: "string",
               enum: ["uncommitted", "base", "commit", "custom"],

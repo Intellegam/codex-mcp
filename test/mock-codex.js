@@ -120,6 +120,7 @@ rl.on("line", (line) => {
       threads.set(threadId, {
         cwd: params.cwd,
         sandbox: params.sandbox,
+        model: params.model || "mock-model",
         ephemeral: params.ephemeral,
         archived: false,
       });
@@ -136,7 +137,7 @@ rl.on("line", (line) => {
           approvalPolicy: params.approvalPolicy || "never",
           approvalsReviewer: "user",
           cwd: params.cwd || process.cwd(),
-          model: "mock-model",
+          model: params.model || "mock-model",
           modelProvider: "mock",
           sandbox: { type: params.sandbox === "workspace-write" ? "workspaceWrite" : "readOnly" },
         },
@@ -171,7 +172,8 @@ rl.on("line", (line) => {
             },
           });
         } else if (thread) {
-          send({ id, result: { thread: { id: threadId, turns: [], status: "loaded" } } });
+          if (params.model) thread.model = params.model;
+          send({ id, result: { model: thread.model, thread: { id: threadId, turns: [], status: "loaded" } } });
         } else {
           send({ id, error: { code: -32600, message: `no rollout found for thread id ${threadId}` } });
         }
@@ -253,6 +255,7 @@ rl.on("line", (line) => {
         });
         break;
       }
+      if (params.model) { thread.model = params.model; saveThreads(); }
       const turnId = `turn_${Date.now()}`;
 
       // Return the RPC response

@@ -51,6 +51,7 @@ function spawnServer(envOverrides = {}) {
     cwd: SERVER_CWD,
     env: {
       ...process.env,
+      CODEX_MCP_MODEL: "",
       PATH: `${mockBinDir}:${process.env.PATH}`,
       CODEX_TIMEOUT_MS: "3000", // short timeout for tests
       MOCK_EVENT_LOG: eventLog,
@@ -176,7 +177,7 @@ describe("MCP protocol", () => {
     server = spawnServer();
     const resp = await server.mcpInit();
     expect(resp.result.serverInfo.name).toBe("codex-mcp");
-    expect(resp.result.serverInfo.version).toBe("3.3.0");
+    expect(resp.result.serverInfo.version).toBe("3.4.0");
     expect(resp.result.protocolVersion).toBe("2024-11-05");
   });
 
@@ -1451,4 +1452,68 @@ describe("MCP 2026-07-28", () => {
     expect(server.getMockEvents().filter((e) => e.method === "thread/archive").length).toBe(1);
   });
 
+});
+
+describe("shipped model selection", () => {
+  let server;
+  afterEach(() => server?.close());
+  for (const [label, env, requested, expected] of [
+    ["shipped", {}, undefined, "gpt-6.2-sol"],
+    ["server override", { CODEX_MCP_MODEL: "gpt-6.2-astra" }, undefined, "gpt-6.2-astra"],
+    ["per-call override", { CODEX_MCP_MODEL: "gpt-6.2-astra" }, "custom-provider-model", "custom-provider-model"],
+    ["inherit", {}, "inherit", undefined],
+    ["server inherit", { CODEX_MCP_MODEL: "inherit" }, undefined, undefined],
+  ]) {
+    test(`${label} reaches thread/start`, async () => {
+      server = spawnServer(env);
+      const response = await asyncCall(server, 1, "codex", { prompt: "model test", model: requested, async: true });
+      expect(parseSnapshot(response).sessionId).toBeDefined();
+      const start = server.getMockEvents().find((e) => e.method === "thread/start");
+      expect(start.params.model).toBe(expected);
+    });
+  }
+  test("reviews select both thread model and review-model override", async () => {
+    server = spawnServer();
+    await asyncCall(server, 1, "codex-review", { mode: "custom", prompt: "review", model: "custom-review-model", async: true });
+    const start = server.getMockEvents().find((e) => e.method === "thread/start");
+    expect(start.params.model).toBe("custom-review-model");
+    expect(start.params.config.review_model).toBe("custom-review-model");
+  });
+  test("reply selection is retained in memory and recovered from native resume metadata", async () => {
+    server = spawnServer();
+    const first = parseSnapshot(await asyncCall(server, 1, "codex", { prompt: "first", async: true }));
+    await asyncCall(server, 2, "codex-result", { sessionId: first.sessionId, wait: true });
+    await waitForMockMethod(server, "thread/archive");
+    await asyncCall(server, 3, "codex-reply", { sessionId: first.sessionId, prompt: "switch", model: "gpt-6.2-astra", async: true });
+    await asyncCall(server, 4, "codex-result", { sessionId: first.sessionId, wait: true });
+    await waitForCondition(() => server.getMockEvents().filter((e) => e.method === "thread/archive").length === 2, "reply archive missing");
+    await asyncCall(server, 5, "codex-reply", { sessionId: first.sessionId, prompt: "continue", async: true });
+    await asyncCall(server, 6, "codex-result", { sessionId: first.sessionId, wait: true });
+    expect(server.getMockEvents().filter((e) => e.method === "turn/start").at(-1).params.model).toBe("gpt-6.2-astra");
+    expect(server.getMockEvents().filter((e) => e.method === "thread/resume").at(-1).params.model).toBe("gpt-6.2-astra");
+    const stateFile = server.stateFile;
+    await server.endInputAndWait();
+    server = spawnServer({ MOCK_STATE_FILE: stateFile, CODEX_MCP_MODEL: "different-new-session-default" });
+    await asyncCall(server, 7, "codex-reply", { sessionId: first.sessionId, prompt: "after restart", async: true });
+    await waitForMockMethod(server, "turn/start");
+    expect(server.getMockEvents().find((e) => e.method === "turn/start").params.model).toBe("gpt-6.2-astra");
+    expect(server.getMockEvents().find((e) => e.method === "thread/resume").params.model).toBeUndefined();
+  });
+  test("invalid model values fail before backend setup or session mutation", async () => {
+    server = spawnServer();
+    let id = 0;
+    for (const model of [null, {}, 42, "", " ", " gpt-6.2-sol"]) {
+      for (const name of ["codex", "codex-reply", "codex-review"]) {
+        const response = await asyncCall(server, ++id, name, {
+          prompt: "invalid", sessionId: "unstarted", mode: "custom", model, async: true,
+        });
+        expect(parseSnapshot(response).status).toBe("failed");
+      }
+    }
+    const inheritedReply = await asyncCall(server, ++id, "codex-reply", {
+      sessionId: "unstarted", prompt: "inherit", model: "inherit", async: true,
+    });
+    expect(parseSnapshot(inheritedReply).status).toBe("failed");
+    expect(server.getMockEvents()).toEqual([]);
+  });
 });
