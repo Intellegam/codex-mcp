@@ -52,9 +52,29 @@ const exitAfterReviewComplete =
 const exitAfterTurnComplete =
   process.env.MOCK_EXIT_AFTER_TURN_COMPLETE === "1";
 let turnDelay = parseInt(process.env.MOCK_TURN_DELAY_MS, 10) || 0;
+const startDelay = parseInt(process.env.MOCK_TURN_START_DELAY_MS, 10) || 0;
+const startedTurns = new Set();
+const finishedTurns = new Set();
 
 function send(msg) {
+  if (msg.method === "turn/completed") {
+    const key = msg.params.threadId + ":" + msg.params.turn.id;
+    if (finishedTurns.has(key)) return;
+    finishedTurns.add(key);
+    record("mock/turn-completed", { threadId: msg.params.threadId, turnId: msg.params.turn.id });
+  }
   process.stdout.write(JSON.stringify(msg) + "\n");
+}
+
+function afterGate(stage, delay, callback) {
+  const gateDir = process.env.MOCK_TURN_GATE_DIR;
+  setTimeout(function checkGate() {
+    if (gateDir && !fs.existsSync(require("path").join(gateDir, stage))) {
+      setTimeout(checkGate, 5);
+      return;
+    }
+    callback();
+  }, delay);
 }
 
 function record(method, params) {
@@ -244,10 +264,12 @@ rl.on("line", (line) => {
         return;
       }
 
-      // Send notifications after a delay
-      setTimeout(() => {
+      afterGate("ready", startDelay, () => {
+        startedTurns.add(turnId);
+        record("mock/turn-ready", { threadId, turnId });
         send({ method: "turn/started", params: { threadId, turn: { id: turnId } } });
-
+      });
+      afterGate("complete", startDelay + turnDelay, () => {
         const prompt = params.input?.[0]?.text || "";
         const responseText = `Mock response to: ${prompt}`;
 
@@ -267,7 +289,7 @@ rl.on("line", (line) => {
           record("mock/exiting-after-turn", { threadId });
           setTimeout(() => process.exit(1), 10);
         }
-      }, turnDelay);
+      });
       break;
     }
 
@@ -277,6 +299,10 @@ rl.on("line", (line) => {
 
       send({ id, result: { turn: { id: turnId, status: "inProgress", items: [] }, reviewThreadId: threadId } });
 
+      setTimeout(() => {
+        startedTurns.add(turnId);
+        send({ method: "turn/started", params: { threadId, turn: { id: turnId } } });
+      }, startDelay);
       setTimeout(() => {
         send({ method: "turn/started", params: { threadId, turn: { id: turnId } } });
 
@@ -295,12 +321,18 @@ rl.on("line", (line) => {
         if (exitAfterReviewComplete) {
           setTimeout(() => process.exit(1), 10);
         }
-      }, turnDelay);
+      }, startDelay + turnDelay);
       break;
     }
 
     case "turn/interrupt": {
+      if (process.env.MOCK_TURN_START_DELAY_MS && !startedTurns.has(params.turnId)) {
+        record("mock/early-interrupt-rejected", { threadId: params.threadId });
+        send({ id, error: { code: -32600, message: "turn is not active yet" } });
+        break;
+      }
       send({ id, result: {} });
+      if (process.env.MOCK_IGNORE_INTERRUPT === "1") break;
       // Simulate the turn completing after interrupt
       const intThreadId = params.threadId;
       const intTurnId = params.turnId;
