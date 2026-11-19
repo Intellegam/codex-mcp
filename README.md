@@ -228,10 +228,32 @@ codex-result({ sessionId: "bbb...", wait: true })
 
 This works for any combination of `codex`, `codex-reply`, and `codex-review` — not just reviews.
 
+## Model selection
+
+New `codex` and `codex-review` sessions use `gpt-6.2-sol`. Selection order is
+an explicit `model` argument, `CODEX_MCP_MODEL`, then that shipped default.
+Set the argument or environment variable to `inherit` to leave a new session's
+selection to local Codex configuration. Model IDs are passed to the installed
+Codex CLI; unavailable models fail rather than silently changing the selection.
+
+```javascript
+codex({ prompt: "Implement the fix", model: "gpt-6.2-sol" })
+codex({ prompt: "Analyze this architecture", model: "gpt-6.2-astra" })
+codex-review({ mode: "uncommitted", model: "gpt-6.2-sol" })
+```
+
+`codex-reply` keeps the session's model when `model` is omitted, including the
+archive/resume path. Supply a model to switch that session's subsequent turns.
+After an MCP restart, selection depends on the native app-server's resume metadata;
+pass `model` explicitly when retaining a particular choice matters. `inherit` is
+only accepted for new sessions/reviews. New-session defaults never apply to replies. Reasoning effort
+continues to follow Codex configuration; model selection changes no permissions.
+
 ## Configuration
 
 | Environment Variable        | Default            | Description                                             |
 | --------------------------- | ------------------ | ------------------------------------------------------- |
+| `CODEX_MCP_MODEL` | `gpt-6.2-sol` | Default for new sessions/reviews; `inherit` opts into local Codex configuration |
 | `CODEX_TIMEOUT_MS`          | `1800000` (30 min) | Maximum time to wait for a Codex turn to complete       |
 | `CODEX_CANCEL_WATCHDOG_MS` | `30000` (30 sec) | After cancellation, release a synchronous caller with an error if backend settlement is still pending |
 | `CODEX_REQUEST_TIMEOUT_MS`  | `5000` (5 sec)     | Maximum time to wait for an app-server request response |
